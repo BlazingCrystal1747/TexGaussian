@@ -35,7 +35,7 @@ We provide the following pretrained models:
 | TexGaussian-PBR | Text conditional PBR material model trained on Objaverse | 295M | [Download](https://huggingface.co/ymxbj/TexGaussian/resolve/main/PBR_model.safetensors?download=true) |
 
 ## 💡 Inference
-To generate texture/PBR Material for input untextured 3D model, you first need to scale your 3D model to unit sphere and save the normalized mesh:
+To generate texture/PBR material for input untextured 3D model, you first need to scale your 3D model to unit sphere and save the normalized mesh:
 
 ```bash
 python3 scale_to_unit_sphere.py
