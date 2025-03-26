@@ -5,10 +5,73 @@
 
 Physically Based Rendering (PBR) materials play a crucial role in modern graphics, enabling photorealistic rendering across diverse environment maps. Developing an effective and efficient algorithm that is capable of automatically generating high-quality PBR materials rather than RGB texture for 3D meshes can significantly streamline the 3D content creation. Most existing methods leverage pre-trained 2D diffusion models for multi-view image synthesis, which often leads to severe inconsistency between the generated textures and input 3D meshes. This paper presents TexGaussian, a novel method that uses octant-aligned 3D Gaussian Splatting for rapid PBR material generation. Specifically, we place each 3D Gaussian on the finest leaf node of the octree built from the input 3D mesh to render the multi-view images not only for the albedo map but also for roughness and metallic. Moreover, our model is trained in a regression manner instead of diffusion denoising, capable of generating the PBR material for a 3D mesh in a single feed-forward process. Extensive experiments on publicly available benchmarks demonstrate that our method synthesizes more visually pleasing PBR materials and runs faster than previous methods in both unconditional and text-conditional scenarios, which exhibit better consistency with the given geometry.
 
+## 📦 Installation
+
+```bash
+conda create -n texgaussian python==3.10
+pip3 install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
+
+# a modified gaussian splatting (+ depth, alpha rendering)
+git clone --recursive https://github.com/ashawkey/diff-gaussian-rasterization
+
+pip3 install ./diff-gaussian-rasterization
+
+pip3 install git+https://github.com/NVlabs/nvdiffrast
+
+# other dependencies
+pip3 install -r requirements.txt
+```
+
+## 🤖 Pretrained Models
+
+We provide the following pretrained models:
+
+| Model | Description | #Params | Download |
+| --- | --- | --- | --- |
+| TexGaussian-bench | Unconditional RGB texture model trained on ShapeNet bench | - | [Download]() |
+| TexGaussian-car | Unconditional RGB texture model trained on ShapeNet car | - | [Download]() |
+| TexGaussian-chair | Unconditional RGB texture model trained on ShapeNet chair | - | [Download]() |
+| TexGaussian-table | Unconditional RGB texture model trained on ShapeNet table | - | [Download]() |
+| TexGaussian-PBR | Text conditional PBR material model trained on Objaverse | 295M | [Download](https://huggingface.co/ymxbj/TexGaussian/resolve/main/PBR_model.safetensors?download=true) |
+
+## 💡 Inference
+To generate texture/PBR Material for input untextured 3D model, you first need to scale your 3D model to unit sphere and save the normalized mesh:
+
+```bash
+python3 scale_to_unit_sphere.py
+```
+
+### PBR Material
+For text conditional PBR material generation, run
+```bash
+bash inference_for_PBR_material.sh
+```
+After texture and material baking, you will get two maps, one is albedo map and another one is PBR material map. Specifically, the PBR material map contains three channel, where the green channel represent the roughness value and the blue channel represent the metallic value.
+
+What's more We recommend everyone to imitate the style of Cap3D dataset's text and create your own prompts for better generation results. The Cap3D dataset can be downloaded in [here]().
+
+### RGB Texture
+For unconditional RGB texture generation, which only works for specific 4 categories: bench, car, chair, table.
+```bash
+bash inference_for_RGB_texture.sh
+```
+After texture baking, you will get one albedo map.
+
+## 🏋️‍♂️ Training
+For Objaverse:
+```bash
+bash train_for_objaverse.sh
+```
+
+For ShapeNet:
+```bash
+bash train_for_shapenet.sh
+```
+
 ## 🚧 TODO
-- [ ] Release training and inference code
-- [ ] Release unconditional albedo-only pre-trained model on ShapeNet Dataset
-- [ ] Release text-conditional PBR pre-trained model on Objaverse Dataset
+- [x] Release training and inference code
+- [x] Release unconditional albedo-only pre-trained model on ShapeNet Dataset
+- [x] Release text-conditional PBR pre-trained model on Objaverse Dataset
 - [ ] Release dataset and dataset toolkits
 
 <!-- Citation -->
