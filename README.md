@@ -26,7 +26,7 @@ pip3 install -r requirements.txt
 
 We provide the following pretrained models:
 
-| Model | Description | #Params | Download |
+| Model | Description | Params | Download |
 | --- | --- | --- | --- |
 | TexGaussian-bench | Unconditional RGB texture model trained on ShapeNet bench | - | [Download]() |
 | TexGaussian-car | Unconditional RGB texture model trained on ShapeNet car | - | [Download]() |
@@ -48,7 +48,7 @@ bash inference_for_PBR_material.sh
 ```
 After texture and material baking, you will get two maps, one is albedo map and another one is PBR material map. Specifically, the PBR material map contains three channel, where the green channel represent the roughness value and the blue channel represent the metallic value.
 
-What's more We recommend everyone to imitate the style of Cap3D dataset's text and create your own prompts for better generation results. The Cap3D dataset can be downloaded in [here]().
+What's more We recommend everyone to imitate the style of Cap3D dataset's text and create your own prompts for better generation results. The Cap3D dataset can be downloaded in [here](https://huggingface.co/ymxbj/TexGaussian/resolve/main/Cap3D_automated_Objaverse_full.csv?download=true).
 
 ### RGB Texture
 For unconditional RGB texture generation, which only works for specific 4 categories: bench, car, chair, table.
@@ -70,7 +70,7 @@ bash train_for_shapenet.sh
 
 ## 🚧 TODO
 - [x] Release training and inference code
-- [x] Release unconditional albedo-only pre-trained model on ShapeNet Dataset
+- [ ] Release unconditional albedo-only pre-trained model on ShapeNet Dataset
 - [x] Release text-conditional PBR pre-trained model on Objaverse Dataset
 - [ ] Release dataset and dataset toolkits
 
