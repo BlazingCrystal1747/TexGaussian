@@ -69,6 +69,15 @@ bash train_for_shapenet.sh
 - [x] Release text-conditional PBR pre-trained model on Objaverse Dataset
 - [ ] Release dataset and dataset toolkits
 
+## 📚Acknowledgement
+
+This work is built on many amazing research works and open-source projects, thanks a lot to all the authors for sharing!
+
+- [gaussian-splatting](https://github.com/graphdeco-inria/gaussian-splatting) and [diff-gaussian-rasterization](https://github.com/graphdeco-inria/diff-gaussian-rasterization)
+- [nvdiffrast](https://github.com/NVlabs/nvdiffrast)
+- [LGM](https://github.com/3DTopia/LGM)
+- [ocnn-pytorch](https://github.com/octree-nn/ocnn-pytorch)
+
 <!-- Citation -->
 ## 📜 Citation
 
