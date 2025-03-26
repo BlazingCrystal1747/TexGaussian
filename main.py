@@ -43,7 +43,7 @@ def main():
     opt.use_material = str2bool(opt.use_material)
     opt.gaussian_loss = str2bool(opt.gaussian_loss)
     opt.use_text = str2bool(opt.use_text)
-    opt.use_local_ckpt = str2bool(opt.use_local_ckpt)
+    opt.use_local_pretrained_ckpt = str2bool(opt.use_local_pretrained_ckpt)
 
     current_time = get_time()
 

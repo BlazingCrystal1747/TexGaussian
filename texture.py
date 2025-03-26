@@ -418,6 +418,7 @@ if __name__ == "__main__":
     opt.use_material = str2bool(opt.use_material)
     opt.save_image = str2bool(opt.save_image)
     opt.gaussian_loss = str2bool(opt.gaussian_loss)
+    opt.use_local_pretrained_ckpt = str2bool(opt.use_local_pretrained_ckpt)
 
     output_dir = opt.output_dir
     os.makedirs(output_dir, exist_ok=True)
