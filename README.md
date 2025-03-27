@@ -28,10 +28,10 @@ We provide the following pretrained models:
 
 | Model | Description | Params | Download |
 | --- | --- | --- | --- |
-| TexGaussian-bench | Unconditional RGB texture model trained on ShapeNet bench | - | [Download]() |
-| TexGaussian-car | Unconditional RGB texture model trained on ShapeNet car | - | [Download]() |
-| TexGaussian-chair | Unconditional RGB texture model trained on ShapeNet chair | - | [Download]() |
-| TexGaussian-table | Unconditional RGB texture model trained on ShapeNet table | - | [Download]() |
+| TexGaussian-bench | Unconditional RGB texture model trained on ShapeNet bench | 70M | [Download](https://huggingface.co/ymxbj/TexGaussian/resolve/main/bench.safetensors?download=true) |
+| TexGaussian-car | Unconditional RGB texture model trained on ShapeNet car | 70M | [Download](https://huggingface.co/ymxbj/TexGaussian/resolve/main/car.safetensors?download=true) |
+| TexGaussian-chair | Unconditional RGB texture model trained on ShapeNet chair | 70M | [Download](https://huggingface.co/ymxbj/TexGaussian/resolve/main/chair.safetensors?download=true) |
+| TexGaussian-table | Unconditional RGB texture model trained on ShapeNet table | 70M | [Download](https://huggingface.co/ymxbj/TexGaussian/resolve/main/table.safetensors?download=true) |
 | TexGaussian-PBR | Text conditional PBR material model trained on Objaverse | 295M | [Download](https://huggingface.co/ymxbj/TexGaussian/resolve/main/PBR_model.safetensors?download=true) |
 
 ## 💡 Inference
@@ -65,7 +65,7 @@ bash train_for_shapenet.sh
 
 ## 🚧 TODO
 - [x] Release training and inference code
-- [ ] Release unconditional albedo-only pre-trained model on ShapeNet Dataset
+- [x] Release unconditional albedo-only pre-trained model on ShapeNet Dataset
 - [x] Release text-conditional PBR pre-trained model on Objaverse Dataset
 - [ ] Release dataset and dataset toolkits
 
