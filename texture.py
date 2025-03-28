@@ -400,7 +400,7 @@ class Converter(nn.Module):
         
         mesh = Mesh(v=self.v, f=self.f, vt=self.vt, ft=self.ft, albedo=torch.sigmoid(self.albedo), device=self.device)
         mesh.auto_normal()
-        albedo_path = os.path.join(save_dir, 'albeod_mesh.obj')
+        albedo_path = os.path.join(save_dir, 'albedo_mesh.obj')
         mesh.write(albedo_path)
 
         if self.opt.use_material:
