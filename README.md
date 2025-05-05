@@ -41,7 +41,7 @@ For text conditional PBR material generation, run
 ```bash
 bash inference_for_PBR_material.sh
 ```
-After texture and material baking, you will get two maps, one is albedo map and another one is PBR material map. Specifically, the PBR material map contains three channel, where the green channel represents roughness value and the blue channel represents metallic value.
+After texture and material baking, you will get two maps, one is albedo map and another one is PBR material map. Specifically, the PBR material map contains three channel, where the green channel represents roughness value and the blue channel represents metallic value. To perform PBR rendering of the generated texture and material maps, we recommend using [this rendering script](https://github.com/ymxbj/BlenderToolboxPBR) written by bpy.
 
 What's more, we recommend everyone to imitate the style of Cap3D dataset's text and create your own prompts for better generation results. The Cap3D dataset can be downloaded in [here](https://huggingface.co/ymxbj/TexGaussian/resolve/main/Cap3D_automated_Objaverse_full.csv?download=true).
 
