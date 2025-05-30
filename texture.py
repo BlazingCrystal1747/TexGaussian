@@ -9,7 +9,7 @@ import argparse
 
 import trimesh
 import os
-from core.regression_models import LGM
+from core.regression_models import TexGaussian
 from core.options import AllConfigs, Options
 from core.gs import GaussianRenderer
 from external.clip import tokenize
@@ -63,7 +63,7 @@ class Converter(nn.Module):
         self.vt = self.ft = None
         self.deform = None
 
-        self.model = LGM(opt, self.device)
+        self.model = TexGaussian(opt, self.device)
 
         self.pointcloud_dir = self.opt.pointcloud_dir
 

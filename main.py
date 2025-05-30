@@ -8,7 +8,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 from core.utils import seed_everything
 from core.options import AllConfigs
-from core.regression_models import LGM
+from core.regression_models import TexGaussian
 from accelerate import Accelerator
 from safetensors.torch import load_file
 from core.dataset import TexGaussianDataset as Dataset
@@ -64,7 +64,7 @@ def main():
     device = accelerator.device
 
     # model
-    model = LGM(opt, device)
+    model = TexGaussian(opt, device)
 
     if accelerator.is_main_process:
 

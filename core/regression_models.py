@@ -18,7 +18,7 @@ from ocnn.octree import Octree, Points
 from core.utils import *
 from clip_networks.network import CLIPTextEncoder
 
-class LGM(nn.Module):
+class TexGaussian(nn.Module):
     def __init__(self, opt, device):
         super().__init__()
 
