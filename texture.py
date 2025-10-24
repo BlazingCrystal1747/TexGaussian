@@ -268,14 +268,14 @@ class Converter(nn.Module):
                 image_gt, alpha_gt = self.render_gs(pose)
                 image_pred, alpha_pred = self.render_mesh(pose)
 
-                if opt.save_image:
+                if self.opt.save_image:
                     image_gt_save = image_gt.detach().cpu().numpy()
                     image_gt_save = image_gt_save.transpose(1, 2, 0)
-                    kiui.write_image(f'{self.opt.output_dir}/{opt.texture_uid}/albedo_gt_images/{i}.jpg', image_gt_save)
+                    kiui.write_image(f'{self.opt.output_dir}/{self.opt.texture_name}/albedo_gt_images/{i}.jpg', image_gt_save)
 
                     image_pred_save = image_pred.detach().cpu().numpy()
                     image_pred_save = image_pred_save.transpose(1, 2, 0)
-                    kiui.write_image(f'{self.opt.output_dir}/{opt.texture_uid}/mesh_albedo_images/{i}.jpg', image_pred_save)
+                    kiui.write_image(f'{self.opt.output_dir}/{self.opt.texture_name}/mesh_albedo_images/{i}.jpg', image_pred_save)
 
                 loss_mse = F.mse_loss(image_pred, image_gt)
                 loss = loss_mse
@@ -300,14 +300,14 @@ class Converter(nn.Module):
             image_gt, alpha_gt = self.render_gs(pose)
             image_pred, alpha_pred = self.render_mesh(pose)
 
-            if opt.save_image:
+            if self.opt.save_image:
                 image_gt_save = image_gt.detach().cpu().numpy()
                 image_gt_save = image_gt_save.transpose(1, 2, 0)
-                kiui.write_image(f'{self.opt.output_dir}/{opt.texture_uid}/albedo_gt_images/{i}.jpg', image_gt_save)
+                kiui.write_image(f'{self.opt.output_dir}/{self.opt.texture_name}/albedo_gt_images/{i}.jpg', image_gt_save)
 
                 image_pred_save = image_pred.detach().cpu().numpy()
                 image_pred_save = image_pred_save.transpose(1, 2, 0)
-                kiui.write_image(f'{self.opt.output_dir}/{opt.texture_uid}/mesh_albedo_images/{i}.jpg', image_pred_save)
+                kiui.write_image(f'{self.opt.output_dir}/{self.opt.texture_name}/mesh_albedo_images/{i}.jpg', image_pred_save)
 
             loss_mse = F.mse_loss(image_pred, image_gt)
             loss = loss_mse
@@ -335,14 +335,14 @@ class Converter(nn.Module):
                     image_gt, alpha_gt = self.render_gs(pose, use_material = True)
                     image_pred, alpha_pred = self.render_mesh(pose, use_material = True)
 
-                    if opt.save_image:
+                    if self.opt.save_image:
                         image_gt_save = image_gt.detach().cpu().numpy()
                         image_gt_save = image_gt_save.transpose(1, 2, 0)
-                        kiui.write_image(f'{self.opt.output_dir}/{opt.texture_uid}/material_gt_images/{i}.jpg', image_gt_save)
+                        kiui.write_image(f'{self.opt.output_dir}/{self.opt.texture_name}/material_gt_images/{i}.jpg', image_gt_save)
 
                         image_pred_save = image_pred.detach().cpu().numpy()
                         image_pred_save = image_pred_save.transpose(1, 2, 0)
-                        kiui.write_image(f'{self.opt.output_dir}/{opt.texture_uid}/mesh_material_images/{i}.jpg', image_pred_save)
+                        kiui.write_image(f'{self.opt.output_dir}/{self.opt.texture_name}/mesh_material_images/{i}.jpg', image_pred_save)
 
                     loss_mse = F.mse_loss(image_pred, image_gt)
                     loss = loss_mse
@@ -367,14 +367,14 @@ class Converter(nn.Module):
                 image_gt, alpha_gt = self.render_gs(pose, use_material = True)
                 image_pred, alpha_pred = self.render_mesh(pose, use_material = True)
 
-                if opt.save_image:
+                if self.opt.save_image:
                     image_gt_save = image_gt.detach().cpu().numpy()
                     image_gt_save = image_gt_save.transpose(1, 2, 0)
-                    kiui.write_image(f'{self.opt.output_dir}/{opt.texture_uid}/material_gt_images/{i}.jpg', image_gt_save)
+                    kiui.write_image(f'{self.opt.output_dir}/{self.opt.texture_name}/material_gt_images/{i}.jpg', image_gt_save)
 
                     image_pred_save = image_pred.detach().cpu().numpy()
                     image_pred_save = image_pred_save.transpose(1, 2, 0)
-                    kiui.write_image(f'{self.opt.output_dir}/{opt.texture_uid}/mesh_material_images/{i}.jpg', image_pred_save)
+                    kiui.write_image(f'{self.opt.output_dir}/{self.opt.texture_name}/mesh_material_images/{i}.jpg', image_pred_save)
 
                 loss_mse = F.mse_loss(image_pred, image_gt)
                 loss = loss_mse
