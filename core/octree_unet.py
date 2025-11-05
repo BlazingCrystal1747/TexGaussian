@@ -17,7 +17,7 @@ def ckpt_conv_wrapper(conv_op, x, *args):
     dummy = torch.ones(1, dtype=torch.float32, requires_grad=True)
 
     return checkpoint(
-        conv_wrapper, x, dummy, *args, use_reentrant=True)
+        conv_wrapper, x, dummy, *args, use_reentrant=False)
 
 class CrossAttention(nn.Module):
     def __init__(
@@ -155,7 +155,7 @@ class DownBlock(nn.Module):
             x = net(x, octree, depth)
             if attn:
                 if self.use_checkpoint:
-                    x = checkpoint(attn, x, octree, depth, condition)
+                    x = checkpoint(attn, x, octree, depth, condition, use_reentrant=False)
                 else:
                     x = attn(x, octree, depth, condition)
             xs.append(x)
@@ -204,7 +204,7 @@ class MidBlock(nn.Module):
         for attn, net in zip(self.attns, self.nets[1:]):
             if attn:
                 if self.use_checkpoint:
-                    x = checkpoint(attn, x, octree, depth, condition)
+                    x = checkpoint(attn, x, octree, depth, condition, use_reentrant=False)
                 else:
                     x = attn(x, octree, depth, condition)
             x = net(x, octree, depth)
@@ -256,7 +256,7 @@ class UpBlock(nn.Module):
             x = net(x, octree, depth)
             if attn:
                 if self.use_checkpoint:
-                    x = checkpoint(attn, x, octree, depth, condition)
+                    x = checkpoint(attn, x, octree, depth, condition, use_reentrant=False)
                 else:
                     x = attn(x, octree, depth, condition)
             
