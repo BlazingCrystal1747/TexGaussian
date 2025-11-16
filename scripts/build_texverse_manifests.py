@@ -210,8 +210,8 @@ def verify_pbr_and_workflow(glb_path:str)->(bool, Optional[str]):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="YiboZhang2001/TexVerse")
-    ap.add_argument("--data-root", default="dataset/texverse")
-    ap.add_argument("--out-dir", default="dataset/texverse/splits")
+    ap.add_argument("--data-root", default="../datasets/texverse")
+    ap.add_argument("--out-dir", default="../datasets/texverse/splits")
 
     # split & sampling
     ap.add_argument("--train-num", type=int, default=800)

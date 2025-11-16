@@ -5,7 +5,7 @@ import os
 from huggingface_hub import hf_hub_download
 
 repo = "YiboZhang2001/TexVerse"
-out  = "./dataset/texverse"
+out  = os.path.abspath(os.path.join("..", "datasets", "texverse"))
 os.makedirs(out, exist_ok=True)
 
 files = [

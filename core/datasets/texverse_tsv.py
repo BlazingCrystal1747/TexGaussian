@@ -110,15 +110,15 @@ class TexVerseTSV(Dataset):
 if __name__ == "__main__":
     """
     最小自测：
-      1) 默认查找：./dataset/texverse/splits/train.tsv 作为 DEMO_TSV
+      1) 默认查找：../datasets/texverse/splits/train.tsv 作为 DEMO_TSV
       2) 可通过环境变量覆盖：
             DEMO_TSV=<path/to/splits/texverse/train.tsv>
-            DEMO_DATA_ROOT=<path/to/dataset/texverse>
+            DEMO_DATA_ROOT=<path/to/datasets/texverse>
     """
     # 推断仓库根与默认路径
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    default_tsv = os.path.join(repo_root, "dataset", "texverse", "splits", "train.tsv")
-    default_data_root = os.path.join(repo_root, "dataset", "texverse")
+    default_tsv = os.path.join(repo_root, "..", "datasets", "texverse", "splits", "train.tsv")
+    default_data_root = os.path.join(repo_root, "..", "datasets", "texverse")
 
     demo_tsv = os.environ.get("DEMO_TSV", default_tsv)
     data_root = os.environ.get("DEMO_DATA_ROOT", default_data_root)
