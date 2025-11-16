@@ -223,8 +223,8 @@ def main():
     ap.set_defaults(enforce_bucket_balance=True)
 
     # geometry/animation filters
-    ap.add_argument("--face-min", type=int, default=5000)
-    ap.add_argument("--face-max", type=int, default=500000)
+    ap.add_argument("--face-min", type=int, default=10000)
+    ap.add_argument("--face-max", type=int, default=50000)
     ap.add_argument("--allow-rigged", action="store_true")
     ap.add_argument("--allow-anim", action="store_true")
 
