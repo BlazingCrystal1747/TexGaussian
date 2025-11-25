@@ -1,0 +1,1 @@
+python scripts/download_texverse_raw.py --total-num 10
