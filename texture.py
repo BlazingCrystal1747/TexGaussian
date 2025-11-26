@@ -1,4 +1,5 @@
 import os
+import csv
 import tyro
 import tqdm
 import numpy as np
@@ -8,7 +9,6 @@ import torch.nn.functional as F
 import argparse
 
 import trimesh
-import os
 from core.regression_models import TexGaussian
 from core.options import AllConfigs, Options
 from core.gs import GaussianRenderer
@@ -67,18 +67,25 @@ class Converter(nn.Module):
 
         self.pointcloud_dir = self.opt.pointcloud_dir
 
-        if self.opt.use_text:
-            text = self.opt.text_prompt
-
-            token = tokenize(text)
-            token = token.to(self.device)
-
-            self.text_embedding = self.model.text_encoder.encode(token).float() # [bs, 77, 768]
+        self.text_embedding = None
+        if self.opt.use_text and self.opt.text_prompt:
+            self.set_text_prompt(self.opt.text_prompt)
     
     def normalize_mesh(self):
         self.mesh.vertices = self.mesh.vertices - self.mesh.bounding_box.centroid
         distances = np.linalg.norm(self.mesh.vertices, axis=1)
         self.mesh.vertices /= np.max(distances)
+
+    def set_text_prompt(self, text_prompt: str):
+        """Update text prompt and re-encode embedding."""
+        self.opt.text_prompt = text_prompt
+        if not self.opt.use_text:
+            self.text_embedding = None
+            return
+
+        token = tokenize(text_prompt)
+        token = token.to(self.device)
+        self.text_embedding = self.model.text_encoder.encode(token).float() # [bs, 77, 768]
 
     def load_mesh(self, path, num_samples = 200000):
         self.mesh = trimesh.load(path, force = 'mesh')
@@ -410,25 +417,69 @@ class Converter(nn.Module):
             mr_path = os.path.join(save_dir, 'mr_mesh.obj')
             mr_mesh.write(mr_path)
 
+def load_batch_from_tsv(tsv_path: str):
+    if not os.path.isfile(tsv_path):
+        raise FileNotFoundError(f"TSV file not found: {tsv_path}")
+
+    with open(tsv_path, "r", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        rows = [row for row in reader]
+
+    return rows
+
 if __name__ == "__main__":
 
     opt = tyro.cli(AllConfigs)
 
     opt.use_checkpoint = str2bool(opt.use_checkpoint)
     opt.use_material = str2bool(opt.use_material)
+    opt.use_text = str2bool(opt.use_text)
     opt.save_image = str2bool(opt.save_image)
     opt.gaussian_loss = str2bool(opt.gaussian_loss)
     opt.use_local_pretrained_ckpt = str2bool(opt.use_local_pretrained_ckpt)
 
+    if opt.tsv_path is None and opt.batch_path is not None:
+        opt.tsv_path = opt.batch_path
+
     output_dir = opt.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    name = opt.texture_name
-
-    converter = Converter(opt).cuda() 
-
-    converter.load_mesh(opt.mesh_path)
+    converter = Converter(opt).cuda()
     converter.load_ckpt(opt.ckpt_path)
-    converter.fit_mesh_uv(iters = 1000)
+
+    if opt.tsv_path:
+        tsv_dir = os.path.dirname(os.path.abspath(opt.tsv_path))
+        batch_rows = load_batch_from_tsv(opt.tsv_path)
+        print(f"[INFO] Loaded {len(batch_rows)} rows from {opt.tsv_path}")
+
+        for idx, row in enumerate(batch_rows):
+            mesh_path = (row.get("mesh") or "").strip()
+            caption = (row.get("caption") or "").strip()
+            obj_id = (row.get("obj_id") or "").strip() or f"sample_{idx}"
+
+            if not mesh_path or not caption:
+                print(f"[WARN] Skip row {idx}: missing mesh or caption (obj_id={obj_id})")
+                continue
+
+            if not os.path.isabs(mesh_path):
+                mesh_path = os.path.join(tsv_dir, mesh_path)
+
+            converter.opt.texture_name = obj_id
+            converter.opt.mesh_path = mesh_path
+            converter.set_text_prompt(caption)
+
+            sample_output_dir = os.path.join(output_dir, converter.opt.texture_name)
+            os.makedirs(sample_output_dir, exist_ok=True)
+
+            print(f"[INFO] Processing {converter.opt.texture_name} ({idx + 1}/{len(batch_rows)})")
+            converter.load_mesh(mesh_path)
+            converter.fit_mesh_uv(iters = 1000)
+            converter.export_mesh(sample_output_dir)
+    else:
+        if opt.use_text and opt.text_prompt:
+            converter.set_text_prompt(opt.text_prompt)
+        converter.load_mesh(opt.mesh_path)
+        converter.fit_mesh_uv(iters = 1000)
+        converter.export_mesh(os.path.join(output_dir, opt.texture_name))
 
     converter.export_mesh(os.path.join(output_dir, opt.texture_name))
