@@ -1,5 +1,7 @@
 import os
 import csv
+import json
+from dataclasses import asdict, is_dataclass
 import tyro
 import tqdm
 import numpy as np
@@ -427,6 +429,38 @@ def load_batch_from_tsv(tsv_path: str):
 
     return rows
 
+def to_jsonable(obj):
+    if is_dataclass(obj):
+        obj = asdict(obj)
+    if isinstance(obj, dict):
+        return {k: to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    # fallback for types like numpy scalars etc.
+    try:
+        return obj.item()
+    except Exception:
+        return str(obj)
+
+def save_experiment_config(exp_dir, opt, processed_samples, skipped_samples=None):
+    cfg = {
+        "options": to_jsonable(opt),
+        "ckpt_path": opt.ckpt_path,
+        "tsv_path": os.path.abspath(opt.tsv_path) if opt.tsv_path else None,
+        "save_image": opt.save_image,
+        "processed_samples": processed_samples,
+    }
+    if skipped_samples:
+        cfg["skipped_samples"] = skipped_samples
+
+    os.makedirs(exp_dir, exist_ok=True)
+    config_path = os.path.join(exp_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
 if __name__ == "__main__":
 
     opt = tyro.cli(AllConfigs)
@@ -443,6 +477,7 @@ if __name__ == "__main__":
 
     output_dir = opt.output_dir
     os.makedirs(output_dir, exist_ok=True)
+    textures_dir = os.path.join(output_dir, "textures") if opt.tsv_path else output_dir
 
     converter = Converter(opt).cuda()
     converter.load_ckpt(opt.ckpt_path)
@@ -451,6 +486,10 @@ if __name__ == "__main__":
         tsv_dir = os.path.dirname(os.path.abspath(opt.tsv_path))
         batch_rows = load_batch_from_tsv(opt.tsv_path)
         print(f"[INFO] Loaded {len(batch_rows)} rows from {opt.tsv_path}")
+        os.makedirs(textures_dir, exist_ok=True)
+
+        processed_samples = []
+        skipped_samples = []
 
         for idx, row in enumerate(batch_rows):
             mesh_path = (row.get("mesh") or "").strip()
@@ -459,6 +498,7 @@ if __name__ == "__main__":
 
             if not mesh_path or not caption:
                 print(f"[WARN] Skip row {idx}: missing mesh or caption (obj_id={obj_id})")
+                skipped_samples.append({"obj_id": obj_id, "reason": "missing mesh or caption"})
                 continue
 
             if not os.path.isabs(mesh_path):
@@ -468,18 +508,33 @@ if __name__ == "__main__":
             converter.opt.mesh_path = mesh_path
             converter.set_text_prompt(caption)
 
-            sample_output_dir = os.path.join(output_dir, converter.opt.texture_name)
+            sample_output_dir = os.path.join(textures_dir, converter.opt.texture_name)
             os.makedirs(sample_output_dir, exist_ok=True)
 
             print(f"[INFO] Processing {converter.opt.texture_name} ({idx + 1}/{len(batch_rows)})")
             converter.load_mesh(mesh_path)
             converter.fit_mesh_uv(iters = 1000)
             converter.export_mesh(sample_output_dir)
+
+            processed_samples.append({
+                "obj_id": converter.opt.texture_name,
+                "caption": caption,
+                "mesh": mesh_path,
+            })
+
+        save_experiment_config(output_dir, opt, processed_samples, skipped_samples)
     else:
         if opt.use_text and opt.text_prompt:
             converter.set_text_prompt(opt.text_prompt)
         converter.load_mesh(opt.mesh_path)
         converter.fit_mesh_uv(iters = 1000)
-        converter.export_mesh(os.path.join(output_dir, opt.texture_name))
+        converter.export_mesh(os.path.join(textures_dir, opt.texture_name))
 
-    converter.export_mesh(os.path.join(output_dir, opt.texture_name))
+        processed_samples = [{
+            "obj_id": opt.texture_name,
+            "caption": opt.text_prompt,
+            "mesh": opt.mesh_path,
+        }]
+        save_experiment_config(output_dir, opt, processed_samples)
+
+    # converter.export_mesh(os.path.join(output_dir, opt.texture_name))

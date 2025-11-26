@@ -20,7 +20,7 @@ EXP_NAME="exp001_test_batch"
 # TSV 路径 (建议绝对路径，或相对于 texGaussian 的路径)
 BATCH_TSV="../experiments/common_splits/test.tsv"
 
-# 输出根目录 (指向 project_root/experiments)
+# 输出根目录 (指向 project_root/experiments/EXP_NAME)
 # 假设脚本在 project_root/texGaussian 下运行
 OUTPUT_ROOT="../experiments/${EXP_NAME}"
 
@@ -29,6 +29,7 @@ OUTPUT_ROOT="../experiments/${EXP_NAME}"
 echo "Starting Batch Inference..."
 echo "Config: ${BATCH_TSV}"
 echo "Output: ${OUTPUT_ROOT}"
+echo "Textures will be stored under: ${OUTPUT_ROOT}/textures"
 
 CUDA_VISIBLE_DEVICES=0 python3 texture.py objaverse \
 --tsv_path "${BATCH_TSV}" \
