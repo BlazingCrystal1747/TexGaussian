@@ -25,6 +25,36 @@ COL_MAP = {
 def log(msg):
     print(f"[Step 4 Render] {msg}")
 
+def resolve_blend_path(args, row):
+    """
+    Decide where to save the .blend file:
+    - Prefer the directory of the input mesh.
+    - Fallback to texture directory (albedo/rough/metal).
+    - Otherwise, fallback to the render output dir.
+    """
+    candidates = []
+    if args.mode == 'pbr':
+        candidates.extend([
+            row.get(COL_MAP['mesh']),
+            row.get(COL_MAP['albedo']),
+            row.get(COL_MAP['rough']),
+            row.get(COL_MAP['metal'])
+        ])
+    else:
+        candidates.append(row.get(COL_MAP['glb']))
+
+    for path in candidates:
+        if not path:
+            continue
+        abs_path = os.path.abspath(path)
+        dir_path = os.path.dirname(abs_path)
+        if dir_path and os.path.exists(dir_path):
+            return os.path.join(dir_path, "scene.blend")
+
+    # fallback: render output folder for this object
+    oid = row.get(COL_MAP['id']) or "scene"
+    return os.path.abspath(os.path.join(args.out_dir, oid, "scene.blend"))
+
 # ================= 1. 场景初始化 =================
 def init_scene(res, samples=64):
     """初始化 Blender 场景：清空、设置 Cycles 引擎、配置 GPU"""
@@ -259,6 +289,16 @@ def render_worker(args):
             met_p = row.get(COL_MAP['metal'])
             set_pbr_material(obj, alb_p, rgh_p, met_p)
         
+        # Optionally save the Blender scene near the mesh/texture assets.
+        if args.save_blend:
+            blend_path = resolve_blend_path(args, row)
+            try:
+                os.makedirs(os.path.dirname(blend_path), exist_ok=True)
+                bpy.ops.wm.save_mainfile(filepath=blend_path)
+                log(f"Saved Blender file to: {blend_path}")
+            except Exception as e:
+                log(f"Failed to save Blender file: {e}")
+        
         # 相机设置
         cam_data = bpy.data.cameras.new("Cam")
         cam = bpy.data.objects.new("Cam", cam_data)
@@ -317,6 +357,8 @@ if __name__ == "__main__":
     parser.add_argument("--res", type=int, default=512, help="Image resolution")
     parser.add_argument("--mode", default="pbr", choices=["pbr", "glb"], 
                         help="Render mode: 'pbr' or 'glb'")
+    parser.add_argument("--save-blend", action="store_true",
+                        help="Save Blender scene (.blend) for each task next to the mesh/texture assets.")
     
     args = parser.parse_args(argv)
     render_worker(args)
