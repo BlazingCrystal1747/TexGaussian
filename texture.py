@@ -407,17 +407,30 @@ class Converter(nn.Module):
 
         self.v = torch.from_numpy(v).contiguous().float().to(self.device)
         
-        mesh = Mesh(v=self.v, f=self.f, vt=self.vt, ft=self.ft, albedo=torch.sigmoid(self.albedo), device=self.device)
+        # Export a single mesh (geometry + UVs only) and write individual PBR textures.
+        mesh = Mesh(v=self.v, f=self.f, vt=self.vt, ft=self.ft, albedo=None, device=self.device)
         mesh.auto_normal()
-        albedo_path = os.path.join(save_dir, 'albedo_mesh.obj')
-        mesh.write(albedo_path)
+        mesh_path = os.path.join(save_dir, 'mesh.obj')
+        mesh.write(mesh_path)
+        # Remove auxiliary files emitted by the writer (mtl / baked albedo).
+        mtl_path = os.path.splitext(mesh_path)[0] + '.mtl'
+        aux_albedo = os.path.join(save_dir, 'mesh_albedo.png')
+        for p in (mtl_path, aux_albedo):
+            if os.path.isfile(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
 
-        if self.opt.use_material:
-            
-            mr_mesh = Mesh(v=self.v, f=self.f, vt=self.vt, ft=self.ft, albedo=torch.sigmoid(self.mr_albedo), device=self.device)
-            mr_mesh.auto_normal()
-            mr_path = os.path.join(save_dir, 'mr_mesh.obj')
-            mr_mesh.write(mr_path)
+        albedo_img = torch.sigmoid(self.albedo).detach().clamp(0, 1).cpu().numpy()
+        kiui.write_image(os.path.join(save_dir, 'albedo.png'), albedo_img)
+
+        if self.opt.use_material and hasattr(self, "mr_albedo"):
+            mr_img = torch.sigmoid(self.mr_albedo).detach().clamp(0, 1).cpu().numpy()
+            roughness = mr_img[..., 1:2]  # G channel
+            metallic = mr_img[..., 2:3]   # B channel
+            kiui.write_image(os.path.join(save_dir, 'metallic.png'), metallic)
+            kiui.write_image(os.path.join(save_dir, 'roughness.png'), roughness)
 
 def load_batch_from_tsv(tsv_path: str):
     if not os.path.isfile(tsv_path):
