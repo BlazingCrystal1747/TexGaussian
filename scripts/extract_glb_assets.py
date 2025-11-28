@@ -41,6 +41,44 @@ def safe_mkdir(path):
 def log(msg):
     print(f"[Extract] {msg}")
 
+def load_first_matching_image(paths):
+    """
+    Try to open the first existing image path from a list and return a PIL Image.
+    """
+    for p in paths:
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            with Image.open(p) as img:
+                return img.copy()
+        except Exception:
+            continue
+    return None
+
+def resolve_normal_image(tex_normal, raw_dir):
+    """
+    Ensure we can persist a normal map if it exists in the GLB or exported assets.
+    Priority:
+        1) The normalTexture attached to the material.
+        2) raw_assets/raw_normal.png (if saved earlier).
+        3) Any image in raw_assets whose name hints it's a normal map.
+    """
+    if tex_normal is not None:
+        return tex_normal
+
+    candidates = []
+    if raw_dir and os.path.exists(raw_dir):
+        candidates.append(os.path.join(raw_dir, "raw_normal.png"))
+        # fallback to any file name containing common normal map cues
+        for fn in os.listdir(raw_dir):
+            low = fn.lower()
+            if not low.endswith(('.png', '.jpg', '.jpeg')):
+                continue
+            if "normal" in low or "norm" in low or low.endswith(("_n.png", "_n.jpg", "_n.jpeg")):
+                candidates.append(os.path.join(raw_dir, fn))
+
+    return load_first_matching_image(candidates)
+
 def error_log(oid, reason, log_file="extract_errors.txt"):
     print(f"    !!! ERROR {oid}: {reason}")
     with open(log_file, "a", encoding="utf-8") as f:
@@ -211,17 +249,29 @@ def process_single_model(glb_path, out_dir):
         mr_arr = np.array(tex_mr.convert('RGB'))
         tex_rough = Image.fromarray(mr_arr[..., 1]) # G
         tex_metal = Image.fromarray(mr_arr[..., 2]) # B
+
+    # 归一化后的法线贴图（如果存在则必须导出为 normal.png）
+    normal_img = resolve_normal_image(tex_normal, raw_dir)
     
     # 执行烘焙
     bake_and_save(tex_albedo, base_rgb, os.path.join(out_dir, "albedo.png"), 
                  mode='RGB', require_texture=STRICT_MODE)
     
-    if STRICT_MODE and tex_normal is None:
+    if STRICT_MODE and normal_img is None:
         raise MissingTextureError("Missing Normal Map")
-    elif tex_normal:
-        tex_normal.save(os.path.join(out_dir, "normal.png"))
-    else:
-        pass 
+    elif normal_img:
+        normal_out_path = os.path.join(out_dir, "normal.png")
+        try:
+            normal_img.save(normal_out_path)
+        except Exception as e:
+            raise MissingTextureError(f"Failed to save normal map: {e}")
+        # Keep a copy in raw_assets for inspection if it wasn't saved earlier
+        raw_normal_path = os.path.join(raw_dir, "raw_normal.png")
+        if not os.path.exists(raw_normal_path):
+            try:
+                normal_img.save(raw_normal_path)
+            except Exception:
+                pass 
 
     bake_and_save(tex_metal, metal_list, os.path.join(out_dir, "metallic.png"), 
                  mode='L', require_texture=STRICT_MODE)

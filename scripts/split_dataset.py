@@ -2,18 +2,26 @@
 # -*- coding: utf-8 -*-
 """
 [Step 3] split_dataset.py
-功能：生成数据集的官方划分 (Common Split)
-设计理念：
-   GT (Ground Truth) 只有一份，实验有无数个。
-   为了公平比较，所有实验应使用同一套 Train/Val/Test 划分。
-   本脚本默认将划分文件生成到 experiments/common_splits 文件夹。
+功能：基于 Step 2 产出的 manifest_extracted.tsv 先完成数据划分，供后续渲染脚本直接读取。
+逻辑：
+   - 只检查 Step 2 产出的 mesh/texture 路径是否存在，不检查渲染结果
+   - 输出 train.tsv / val.tsv / test.tsv，列保留用于渲染的路径信息
 """
 
 import os
 import csv
 import random
 import argparse
-import sys
+from typing import List
+
+
+def resolve_path(path: str, base_dir: str) -> str:
+    """Allow relative paths in the manifest by resolving against its directory."""
+    if not path:
+        return ""
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(base_dir, path))
 
 def main():
     parser = argparse.ArgumentParser()
@@ -23,7 +31,7 @@ def main():
     # 输入：Step 2 生成的总表
     parser.add_argument("--manifest", 
                         default="../datasets/texverse_extracted/manifest_extracted.tsv", 
-                        help="Path to the extracted manifest from Step 2")
+                        help="Path to the extracted manifest from Step 2 (for obj_id/mesh/caption).")
 
     # 输出：默认放在 experiments/common_splits，作为所有实验的公共参考
     parser.add_argument("--out-dir", 
@@ -41,47 +49,83 @@ def main():
     args = parser.parse_args()
 
     # ================= 1. 环境检查 =================
-    if not os.path.exists(args.manifest):
-        print(f"[Error] Manifest not found at: {os.path.abspath(args.manifest)}")
+    manifest_path = os.path.abspath(args.manifest)
+    if not os.path.exists(manifest_path):
+        print(f"[Error] Manifest not found at: {manifest_path}")
         print("请先运行 Step 2 (提取脚本) 生成数据列表。")
         return
+    
+    manifest_dir = os.path.dirname(manifest_path)
 
     # 创建输出目录
     os.makedirs(args.out_dir, exist_ok=True)
     print(f"========== Generating Common Splits ==========")
-    print(f"Input Manifest: {args.manifest}")
+    print(f"Input Manifest: {manifest_path}")
     print(f"Output Directory: {os.path.abspath(args.out_dir)}")
     print(f"Random Seed: {args.seed}")
 
     # ================= 2. 读取并校验数据 =================
     valid_data = []
-    # 训练必须的 5 个通道
-    required_cols = ['mesh', 'albedo', 'rough', 'metal', 'normal', 'glb_path']
+    caption_col = None
 
     print(f"Reading and validating data...")
     try:
-        with open(args.manifest, 'r', encoding='utf-8') as f:
+        with open(manifest_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f, delimiter='\t')
-            fieldnames = reader.fieldnames
+            fieldnames_in = reader.fieldnames or []
             
-            # 检查表头
-            for k in required_cols:
-                if k not in fieldnames:
-                    print(f"[Error] Manifest missing column: '{k}'")
-                    return
+            if "obj_id" not in fieldnames_in:
+                print(f"[Error] Manifest missing column: 'obj_id'")
+                return
 
-            # 遍历检查每一行文件的物理存在性
+            mesh_col = "mesh_path" if "mesh_path" in fieldnames_in else ("mesh" if "mesh" in fieldnames_in else None)
+            albedo_col = "albedo" if "albedo" in fieldnames_in else None
+            rough_col = "rough" if "rough" in fieldnames_in else ("roughness" if "roughness" in fieldnames_in else None)
+            metal_col = "metal" if "metal" in fieldnames_in else ("metallic" if "metallic" in fieldnames_in else None)
+            normal_col = "normal" if "normal" in fieldnames_in else None
+
+            if mesh_col is None or albedo_col is None or rough_col is None or metal_col is None or normal_col is None:
+                print("[Error] Manifest missing required texture columns (need mesh/albedo/rough/metal/normal).")
+                return
+            caption_col = "caption" if "caption" in fieldnames_in else None
+
             for row in reader:
-                # 这是一个耗时但必要的步骤，防止训练中途崩溃
-                if all(os.path.exists(row[k]) for k in required_cols):
-                    valid_data.append(row)
-                # else:
-                #    print(f"Skipping {row['obj_id']}: missing files")
+                oid = row.get("obj_id")
+                if not oid:
+                    continue
+
+                mesh_path = resolve_path(row.get(mesh_col), manifest_dir)
+                albedo_path = resolve_path(row.get(albedo_col), manifest_dir)
+                rough_path = resolve_path(row.get(rough_col), manifest_dir)
+                metal_path = resolve_path(row.get(metal_col), manifest_dir)
+                normal_path = resolve_path(row.get(normal_col), manifest_dir)
+
+                required_paths = [mesh_path, albedo_path, rough_path, metal_path, normal_path]
+                if not all(required_paths):
+                    continue
+                if not all(os.path.exists(p) for p in required_paths):
+                    continue
+
+                entry = {
+                    "obj_id": oid,
+                    "mesh": mesh_path,
+                    "albedo": albedo_path,
+                    "rough": rough_path,
+                    "metal": metal_path,
+                    "normal": normal_path,
+                }
+                if caption_col:
+                    entry["caption"] = row.get(caption_col, "")
+                valid_data.append(entry)
 
     except Exception as e:
         print(f"[Error] Failed to read manifest: {e}")
         return
-    
+
+    out_fieldnames = ["obj_id", "mesh", "albedo", "rough", "metal", "normal"]
+    if caption_col:
+        out_fieldnames.append("caption")
+
     total = len(valid_data)
     print(f"Total valid samples: {total}")
 
@@ -108,8 +152,7 @@ def main():
     for name, data in splits.items():
         fname = os.path.join(args.out_dir, f"{name}.tsv")
         with open(fname, 'w', newline='', encoding='utf-8') as f:
-            # 保持和输入一样的表头
-            writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter='\t')
+            writer = csv.DictWriter(f, fieldnames=out_fieldnames, delimiter='\t')
             writer.writeheader()
             writer.writerows(data)
         print(f"  -> Saved {name:<5}: {len(data):>6} samples to {fname}")
@@ -118,7 +161,7 @@ def main():
     info_path = os.path.join(args.out_dir, "split_info.txt")
     with open(info_path, "w") as f:
         f.write(f"Created Date: {os.popen('date').read().strip()}\n")
-        f.write(f"Source Manifest: {os.path.abspath(args.manifest)}\n")
+        f.write(f"Source Manifest: {manifest_path}\n")
         f.write(f"Seed: {args.seed}\n")
         f.write(f"Ratios: {args.ratios}\n")
         f.write(f"Counts: Train={len(splits['train'])}, Val={len(splits['val'])}, Test={len(splits['test'])}\n")
