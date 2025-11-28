@@ -1,1 +1,1 @@
-python scripts/download_texverse_raw.py --total-num 10
+python scripts/download_texverse_raw.py --total-num 20

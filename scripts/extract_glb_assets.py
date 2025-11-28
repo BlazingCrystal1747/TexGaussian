@@ -253,13 +253,19 @@ def process_single_model(glb_path, out_dir):
     # 归一化后的法线贴图（如果存在则必须导出为 normal.png）
     normal_img = resolve_normal_image(tex_normal, raw_dir)
     
+    # 如果缺失法线，则自动生成平面法线贴图 (128,128,255)
+    if normal_img is None:
+        if tex_albedo is not None:
+            w, h = tex_albedo.size
+        else:
+            w, h = 1024, 1024
+        normal_img = Image.new("RGB", (w, h), (128, 128, 255))
+    
     # 执行烘焙
     bake_and_save(tex_albedo, base_rgb, os.path.join(out_dir, "albedo.png"), 
                  mode='RGB', require_texture=STRICT_MODE)
     
-    if STRICT_MODE and normal_img is None:
-        raise MissingTextureError("Missing Normal Map")
-    elif normal_img:
+    if normal_img:
         normal_out_path = os.path.join(out_dir, "normal.png")
         try:
             normal_img.save(normal_out_path)

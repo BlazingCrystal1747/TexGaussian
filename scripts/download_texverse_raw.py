@@ -12,6 +12,28 @@ import argparse
 import random
 import csv
 import struct
+import re
+
+# 确保能找到 repo 根目录下的 external.clip
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+# 兼容 packaging 新版本不自动暴露 version 属性的问题
+try:
+    import packaging
+    import packaging.version as _packaging_version
+    if not hasattr(packaging, "version"):
+        packaging.version = _packaging_version
+except Exception:
+    pass
+
+try:
+    from external.clip import tokenize
+except ImportError:
+    print("Error: clip (external.clip.tokenize) not found. Please ensure CLIP is installed and accessible.")
+    sys.exit(1)
 
 try:
     from huggingface_hub import hf_hub_download
@@ -23,6 +45,41 @@ except ImportError:
 REQUIRED_META = ["metadata.json", "caption.json"]
 # 设定面数上限，避免显存溢出 (TexGaussian 建议)
 MAX_FACE_COUNT = 200000 
+
+GLUE_WORDS_PATTERN = re.compile(
+    r"\b(?:a|an|the|is|are|was|were|consists of|composed of|made of|features|featuring|"
+    r"positioned|located|placed|with|in|on|at|by|to|from|which|that)\b",
+    flags=re.IGNORECASE,
+)
+PREFIX_PATTERN = re.compile(
+    r"^\s*(?:3d model of|pbr material of|object representing)\s*",
+    flags=re.IGNORECASE,
+)
+
+def distill_caption(text: str) -> str:
+    """清洗与压缩描述文本，尽可能保留语义但去除冗余。"""
+    if text is None:
+        return ""
+    # 去前缀
+    text = re.sub(PREFIX_PATTERN, "", text)
+    # 去胶水词
+    text = re.sub(GLUE_WORDS_PATTERN, " ", text)
+    # 标点与换行处理
+    text = text.replace("\n", ",").replace(".", ",")
+    # 合并重复的逗号与空格
+    text = re.sub(r"[,\s]+", " ", text)
+    text = re.sub(r"\s*,\s*", ", ", text)
+    # 去除重复的逗号
+    text = re.sub(r"(,\s*){2,}", ", ", text)
+    # 收尾清理
+    return text.strip(" ,")
+
+def strict_validate(text: str):
+    """严格校验文本长度，不允许截断；超长则抛错。"""
+    try:
+        tokenize(text)
+    except RuntimeError as e:
+        raise ValueError(f"Text too long for CLIP context: {text}") from e
 
 def validate_glb_strict(glb_path):
     """
@@ -149,7 +206,17 @@ def main():
             
             # 严格校验
             if validate_glb_strict(local_path):
-                valid_list.append(item)
+                try:
+                    cap_clean = distill_caption(item["caption"])
+                    strict_validate(cap_clean)
+                    item_clean = {
+                        "obj_id": item["obj_id"],
+                        "rel_glb": item["rel_glb"],
+                        "caption": cap_clean,
+                    }
+                    valid_list.append(item_clean)
+                except ValueError as e:
+                    print(f"[Skip] {item['obj_id']} caption invalid: {e}")
                 if len(valid_list) % 10 == 0:
                     print(f"Qualified: {len(valid_list)}/{args.total_num}")
             else:
