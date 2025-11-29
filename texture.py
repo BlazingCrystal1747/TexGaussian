@@ -457,7 +457,7 @@ def to_jsonable(obj):
     except Exception:
         return str(obj)
 
-def save_experiment_config(exp_dir, opt, processed_samples, skipped_samples=None):
+def save_experiment_config(exp_dir, opt, processed_samples, skipped_samples=None, manifest_path=None):
     cfg = {
         "options": to_jsonable(opt),
         "ckpt_path": opt.ckpt_path,
@@ -467,11 +467,55 @@ def save_experiment_config(exp_dir, opt, processed_samples, skipped_samples=None
     }
     if skipped_samples:
         cfg["skipped_samples"] = skipped_samples
+    if manifest_path:
+        cfg["result_tsv"] = os.path.abspath(manifest_path)
 
     os.makedirs(exp_dir, exist_ok=True)
     config_path = os.path.join(exp_dir, "config.json")
     with open(config_path, "w") as f:
         json.dump(cfg, f, indent=2)
+
+
+def build_result_row(obj_id: str, sample_dir: str, caption: str = None):
+    """Collect generated asset paths for a single sample into a TSV-ready dict."""
+    sample_dir = os.path.abspath(sample_dir)
+
+    def path_if_exists(name: str) -> str:
+        p = os.path.join(sample_dir, name)
+        return os.path.abspath(p) if os.path.exists(p) else ""
+
+    row = {
+        "obj_id": obj_id,
+        "mesh": path_if_exists("mesh.obj"),
+        "albedo": path_if_exists("albedo.png"),
+        "rough": path_if_exists("roughness.png"),
+        "metal": path_if_exists("metallic.png"),
+        "normal": path_if_exists("normal.png"),
+    }
+    if caption is not None:
+        row["caption"] = caption
+    return row
+
+
+def write_result_manifest(tsv_path: str, rows):
+    """Write generated asset info to a TSV following split_dataset-style columns."""
+    if not rows:
+        print(f"[WARN] No rows to write for manifest {tsv_path}")
+        return
+
+    fieldnames = ["obj_id", "mesh", "albedo", "rough", "metal", "normal"]
+    if any("caption" in r for r in rows):
+        fieldnames.append("caption")
+
+    tsv_dir = os.path.dirname(tsv_path) or "."
+    os.makedirs(tsv_dir, exist_ok=True)
+
+    with open(tsv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+    print(f"[INFO] Saved generated manifest to {tsv_path}")
 
 
 if __name__ == "__main__":
@@ -491,6 +535,15 @@ if __name__ == "__main__":
     output_dir = opt.output_dir
     os.makedirs(output_dir, exist_ok=True)
     textures_dir = os.path.join(output_dir, "textures") if opt.tsv_path else output_dir
+
+    result_tsv_path = opt.result_tsv
+    if result_tsv_path:
+        if not os.path.isabs(result_tsv_path):
+            result_tsv_path = os.path.abspath(os.path.join(output_dir, result_tsv_path))
+    else:
+        result_tsv_path = os.path.join(output_dir, "generated_manifest.tsv")
+    result_tsv_path = os.path.abspath(result_tsv_path)
+    opt.result_tsv = result_tsv_path
 
     converter = Converter(opt).cuda()
     converter.load_ckpt(opt.ckpt_path)
@@ -529,25 +582,25 @@ if __name__ == "__main__":
             converter.fit_mesh_uv(iters = 1000)
             converter.export_mesh(sample_output_dir)
 
-            processed_samples.append({
-                "obj_id": converter.opt.texture_name,
-                "caption": caption,
-                "mesh": mesh_path,
-            })
+            processed_samples.append(build_result_row(
+                converter.opt.texture_name,
+                sample_output_dir,
+                caption if caption else None,
+            ))
 
-        save_experiment_config(output_dir, opt, processed_samples, skipped_samples)
+        if processed_samples:
+            write_result_manifest(result_tsv_path, processed_samples)
+        save_experiment_config(output_dir, opt, processed_samples, skipped_samples, manifest_path=result_tsv_path if processed_samples else None)
     else:
         if opt.use_text and opt.text_prompt:
             converter.set_text_prompt(opt.text_prompt)
         converter.load_mesh(opt.mesh_path)
         converter.fit_mesh_uv(iters = 1000)
-        converter.export_mesh(os.path.join(textures_dir, opt.texture_name))
+        sample_output_dir = os.path.join(textures_dir, opt.texture_name)
+        converter.export_mesh(sample_output_dir)
 
-        processed_samples = [{
-            "obj_id": opt.texture_name,
-            "caption": opt.text_prompt,
-            "mesh": opt.mesh_path,
-        }]
-        save_experiment_config(output_dir, opt, processed_samples)
+        processed_samples = [build_result_row(opt.texture_name, sample_output_dir, opt.text_prompt if opt.text_prompt else None)]
+        write_result_manifest(result_tsv_path, processed_samples)
+        save_experiment_config(output_dir, opt, processed_samples, manifest_path=result_tsv_path)
 
     # converter.export_mesh(os.path.join(output_dir, opt.texture_name))
