@@ -1,1 +1,1 @@
-python scripts/download_texverse_raw.py --total-num 20
+CUDA_VISIBLE_DEVICES=0 python scripts/download_texverse_raw.py --total-num 20

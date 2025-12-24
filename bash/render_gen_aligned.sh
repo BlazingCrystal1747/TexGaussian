@@ -39,7 +39,7 @@ echo "Mode:       beauty"
 echo "=============================================="
 
 # 3. 执行渲染
-python ./scripts/render_gen_aligned.py \
+CUDA_VISIBLE_DEVICES=0 python ./scripts/render_gen_aligned.py \
   --manifest "$MANIFEST_PATH" \
   --gt-root "$GT_ROOT" \
   --transforms-subdir "$TRANSFORMS_SUBDIR" \

@@ -1,1 +1,1 @@
-python scripts/split_dataset.py
+CUDA_VISIBLE_DEVICES=0 python scripts/split_dataset.py

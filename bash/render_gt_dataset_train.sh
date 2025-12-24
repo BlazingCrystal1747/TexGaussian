@@ -28,7 +28,7 @@ echo "Output:   $OUT_ROOT/train_unlit"
 echo "=========================================="
 
 # 3. 执行 Python 渲染命令
-python ./scripts/render_gt_dataset.py \
+CUDA_VISIBLE_DEVICES=0 python ./scripts/render_gt_dataset.py \
   --manifest "$MANIFEST_PATH" \
   --out-root "$OUT_ROOT" \
   --mode train \

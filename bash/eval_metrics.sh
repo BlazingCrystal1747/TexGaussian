@@ -39,7 +39,7 @@ echo "Output:        $OUTPUT"
 echo "Conda env:     $ENV_NAME"
 echo "=============================================="
 
-CUDA_VISIBLE_DEVICES=1 python scripts/eval_metrics.py \
+CUDA_VISIBLE_DEVICES=0 python scripts/eval_metrics.py \
   --experiment_name "$EXPERIMENT_NAME" \
   --base_gt_dir "$BASE_GT_DIR" \
   --base_gen_dir "$BASE_GEN_DIR" \

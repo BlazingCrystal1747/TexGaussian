@@ -5,7 +5,7 @@ source "$CONDA_BASE/etc/profile.d/conda.sh"
 
 conda activate blender
 
-python scripts/extract_glb_assets.py \
+CUDA_VISIBLE_DEVICES=0 python scripts/extract_glb_assets.py \
   --tsv "../datasets/texverse/downloaded_manifest.tsv" \
   --data-root "../datasets/texverse" \
   --out-root "../datasets/texverse_extracted"

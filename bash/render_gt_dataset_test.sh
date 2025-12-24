@@ -34,7 +34,7 @@ echo "=========================================="
 
 # 3. 执行 Python 渲染命令
 # 注意：这里使用的是新脚本 render_gt_dataset.py 的参数命名
-python ./scripts/render_gt_dataset.py \
+CUDA_VISIBLE_DEVICES=0 python ./scripts/render_gt_dataset.py \
   --manifest "$MANIFEST_PATH" \
   --out-root "$OUT_ROOT" \
   --mode eval \
