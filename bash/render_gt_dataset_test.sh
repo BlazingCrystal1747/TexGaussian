@@ -44,7 +44,8 @@ CUDA_VISIBLE_DEVICES=0 python ./scripts/render_gt_dataset.py \
   --samples 64 \
   --hdri-strength 1.0 \
   --seed 42 \
-  --save-blend
+  --save-blend \
+  --background white
 
 echo "Done."
 

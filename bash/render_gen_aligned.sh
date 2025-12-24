@@ -48,7 +48,8 @@ CUDA_VISIBLE_DEVICES=0 python ./scripts/render_gen_aligned.py \
   --hdri "$HDRI_PATH" \
   --samples 64 \
   --hdri-strength 1.0 \
-  --save-blend
+  --save-blend \
+  --background transparent
 
 echo "Done."
 

@@ -95,22 +95,70 @@ def reset_scene(width: int, height: int, samples: int) -> bpy.types.Scene:
     return sc
 
 
-def set_hdri(world: bpy.types.World, hdri_path: str, strength: float = 1.0) -> None:
-    if not os.path.exists(hdri_path):
-        raise FileNotFoundError(f"HDRI not found: {hdri_path}")
+def setup_background(scene: bpy.types.Scene, mode: str, hdri_path: str = "", strength: float = 1.0) -> None:
+    world = scene.world or bpy.data.worlds.new("World")
+    scene.world = world
     world.use_nodes = True
     nodes = world.node_tree.nodes
     links = world.node_tree.links
     for n in list(nodes):
         nodes.remove(n)
 
-    env = nodes.new("ShaderNodeTexEnvironment")
-    env.image = bpy.data.images.load(hdri_path)
-    bg = nodes.new("ShaderNodeBackground")
-    bg.inputs["Strength"].default_value = strength
     out = nodes.new("ShaderNodeOutputWorld")
-    links.new(env.outputs["Color"], bg.inputs["Color"])
-    links.new(bg.outputs["Background"], out.inputs["Surface"])
+
+    has_hdri = hdri_path and os.path.exists(hdri_path)
+
+    if has_hdri:
+        # 1. Create the HDRI lighting node (always needed for lighting)
+        env = nodes.new("ShaderNodeTexEnvironment")
+        env.image = bpy.data.images.load(hdri_path)
+        bg_light = nodes.new("ShaderNodeBackground")
+        bg_light.inputs["Strength"].default_value = strength
+        links.new(env.outputs["Color"], bg_light.inputs["Color"])
+
+        if mode == "hdri":
+            scene.render.film_transparent = False
+            links.new(bg_light.outputs["Background"], out.inputs["Surface"])
+        elif mode == "transparent":
+            scene.render.film_transparent = True
+            links.new(bg_light.outputs["Background"], out.inputs["Surface"])
+        else:
+            # black or white
+            scene.render.film_transparent = False
+            
+            mix = nodes.new("ShaderNodeMixShader")
+            light_path = nodes.new("ShaderNodeLightPath")
+            bg_cam = nodes.new("ShaderNodeBackground")
+            
+            if mode == "white":
+                bg_cam.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+                bg_cam.inputs["Strength"].default_value = 1.0
+            else: # black
+                bg_cam.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+                bg_cam.inputs["Strength"].default_value = 0.0
+            
+            links.new(light_path.outputs["Is Camera Ray"], mix.inputs["Fac"])
+            links.new(bg_light.outputs["Background"], mix.inputs[1])
+            links.new(bg_cam.outputs["Background"], mix.inputs[2])
+            links.new(mix.outputs["Shader"], out.inputs["Surface"])
+            
+    else:
+        # No HDRI provided (e.g. unlit mode, or user didn't provide one)
+        bg = nodes.new("ShaderNodeBackground")
+        if mode == "white":
+            scene.render.film_transparent = False
+            bg.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+            bg.inputs["Strength"].default_value = 1.0
+        elif mode == "black":
+            scene.render.film_transparent = False
+            bg.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+            bg.inputs["Strength"].default_value = 0.0
+        else: # transparent or fallback
+            scene.render.film_transparent = True
+            bg.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+            bg.inputs["Strength"].default_value = 0.0
+            
+        links.new(bg.outputs["Background"], out.inputs["Surface"])
 
 
 def import_and_normalize(mesh_path: str) -> bpy.types.Object:
@@ -365,11 +413,12 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
 
     samples = 1 if args.mode == "unlit" else args.samples
     scene = reset_scene(width, height, samples)
-    if args.mode == "beauty":
-        if not args.hdri or not os.path.exists(args.hdri):
-            log(f"{oid}: beauty mode needs a valid --hdri (got {args.hdri}), skip.")
-            return False
-        set_hdri(scene.world, args.hdri, strength=args.hdri_strength)
+    
+    try:
+        setup_background(scene, args.background, args.hdri, args.hdri_strength)
+    except Exception as e:
+        log(f"{oid}: background setup failed ({e}), skip.")
+        return False
 
     mesh_obj = import_and_normalize(mesh_path)
     if not mesh_obj:
@@ -478,6 +527,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--hdri", default="", help="HDRI path (required for beauty mode).")
     parser.add_argument("--hdri-strength", type=float, default=1.0, help="HDRI intensity for beauty mode.")
     parser.add_argument("--samples", type=int, default=64, help="Cycles samples for beauty mode (unlit always uses 1).")
+    parser.add_argument("--background", choices=["black", "white", "hdri", "transparent"], default=None, help="Background mode.")
     parser.add_argument("--fallback-focal", type=float, default=50.0, help="Fallback focal length (mm) if transforms.json lacks focal metadata.")
     parser.add_argument("--save-blend", action="store_true", help="Save a .blend per object for debugging.")
     return parser.parse_args(argv)
@@ -489,6 +539,9 @@ def main(argv: List[str]) -> None:
     args.gt_root = os.path.abspath(args.gt_root)
     manifest_path = os.path.abspath(args.manifest)
     manifest_dir = os.path.dirname(manifest_path)
+
+    if args.background is None:
+        args.background = "hdri" if args.mode == "beauty" else "transparent"
 
     if not os.path.exists(manifest_path):
         log(f"Manifest not found: {manifest_path}")

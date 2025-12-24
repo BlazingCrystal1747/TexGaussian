@@ -35,7 +35,8 @@ CUDA_VISIBLE_DEVICES=0 python ./scripts/render_gt_dataset.py \
   --resolution 512 \
   --views 64 \
   --seed 42 \
-  --save-blend
+  --save-blend \
+  --background transparent
 
 echo "Done."
 
