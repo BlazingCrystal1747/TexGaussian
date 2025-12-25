@@ -422,7 +422,7 @@ def render_train(row: Dict[str, str], args: argparse.Namespace, rng: random.Rand
         return True
 
     scene = reset_scene(args.resolution, samples=1)
-    setup_background(scene, args.background)
+    setup_background(scene, args.background, args.hdri, args.hdri_strength)
     mesh_obj = import_and_normalize(mesh_path)
     if not mesh_obj:
         log(f"{oid}: import failed.")

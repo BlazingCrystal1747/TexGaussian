@@ -268,6 +268,29 @@ def build_pbr_material(albedo: str, rough: str, metal: str, normal: str) -> bpy.
     return mat
 
 
+def build_geometry_normal_material(name: str) -> bpy.types.Material:
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    for n in list(nodes):
+        nodes.remove(n)
+
+    # Fallback for missing normal map:
+    # Output Tangent Space Identity Normal (0.5, 0.5, 1.0)
+    # This ensures compatibility with GT normal maps (which are in tangent space)
+    # for metric computation (PSNR/SSIM).
+    
+    emis = nodes.new("ShaderNodeEmission")
+    emis.inputs["Color"].default_value = (0.5, 0.5, 1.0, 1.0)
+    emis.inputs["Strength"].default_value = 1.0
+    
+    out = nodes.new("ShaderNodeOutputMaterial")
+    
+    links.new(emis.outputs["Emission"], out.inputs["Surface"])
+    return mat
+
+
 def compute_intrinsics(cam_obj: bpy.types.Object, scene: bpy.types.Scene) -> Dict[str, float]:
     cam = cam_obj.data
     render = scene.render
@@ -450,13 +473,16 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
             path = tex_map.get(name)
             if path and os.path.exists(path):
                 emission_mats[name] = build_emission_material(f"{name.upper()}_EMIT", path, cs)
+            elif name == "normal":
+                emission_mats[name] = build_geometry_normal_material(f"{name.upper()}_GEO")
             else:
                 emission_mats[name] = None
 
     cam = create_camera(scene, lens_mm)
     validate_intrinsics(cam, scene, intrinsics, oid)
 
-    out_dir = os.path.join(args.out_root, oid)
+    sub_dir = "eval_lit" if args.mode == "beauty" else "train_unlit"
+    out_dir = os.path.join(args.out_root, sub_dir, oid)
     os.makedirs(out_dir, exist_ok=True)
 
     for idx, frame in enumerate(frames):
