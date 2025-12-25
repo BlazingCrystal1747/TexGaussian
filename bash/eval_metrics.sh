@@ -13,7 +13,7 @@ conda activate "$ENV_NAME"
 # 位置参数: $1=EXPERIMENT_NAME, $2=METRICS(可选，优先级最高)
 EXPERIMENT_NAME="${1:-exp003_test_batch}"
 BASE_GT_DIR="${BASE_GT_DIR:-"../datasets/texverse_rendered/eval_lit"}"
-BASE_GEN_DIR="${BASE_GEN_DIR:-"../experiments/${EXPERIMENT_NAME}/texverse_gen_renders"}"
+BASE_GEN_DIR="${BASE_GEN_DIR:-"../experiments/${EXPERIMENT_NAME}/texverse_gen_renders/eval_lit"}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 DEVICE="${DEVICE:-cuda}"
 KID_SUBSET_SIZE="${KID_SUBSET_SIZE:-50}"
