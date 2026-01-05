@@ -2,8 +2,8 @@
 
 # ========================================================
 # 脚本名称: run_render_test_gt.sh
-# 功能: 使用 render_gt_dataset.py 渲染测试集的 Ground Truth
-# 模式: Eval (Lit PBR + HDRI)
+# 功能: 使用 render_gt_dataset.py 渲染 Ground Truth (Lit + Unlit)
+# 说明: 渲染范围由 MANIFEST_PATH 决定（可用于 train/test/val）
 # ========================================================
 
 # 1. 初始化 Conda 环境 (参考你的 render_pbr_eval.sh)
@@ -15,20 +15,20 @@ conda activate blender
 
 # 2. 设置路径变量 (根据你的项目结构)
 
-# 输入: 划分好的测试集清单
+# 输入: 划分好的数据清单
 MANIFEST_PATH="../experiments/common_splits/test.tsv"
 
-# 输出: 数据集根目录 (脚本会自动创建 eval_lit 子文件夹)
-OUT_ROOT="../datasets/texverse_rendered"
+# 输出: 数据集根目录 (脚本会自动创建 {obj_id}/lit 与 {obj_id}/unlit)
+OUT_ROOT="../datasets/texverse_rendered/test"
 
-# 资源: HDRI 环境贴图 (Eval 模式必须)
+# 资源: HDRI 环境贴图 (lit 渲染必需)
 # 使用你参考脚本中的路径
 HDRI_PATH="../datasets/hdri/rogland_sunset_4k.exr"
 
 echo "=========================================="
-echo "Start Rendering Test Set GT (Eval Mode)"
+echo "Start Rendering GT (Lit+Unlit)"
 echo "Manifest: $MANIFEST_PATH"
-echo "Output:   $OUT_ROOT/eval_lit"
+echo "Output:   $OUT_ROOT/{obj_id}/(lit|unlit)"
 echo "HDRI:     $HDRI_PATH"
 echo "=========================================="
 
@@ -37,7 +37,6 @@ echo "=========================================="
 CUDA_VISIBLE_DEVICES=0 python ./scripts/render_gt_dataset.py \
   --manifest "$MANIFEST_PATH" \
   --out-root "$OUT_ROOT" \
-  --mode eval \
   --hdri "$HDRI_PATH" \
   --resolution 512 \
   --views 20 \

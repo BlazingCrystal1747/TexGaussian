@@ -4,11 +4,12 @@
 render_gen_aligned.py
 
 Render generated meshes/textures using the exact camera poses saved from GT renders
-(`transforms.json`). This reproduces the same viewpoints for visual inspection or
-metric computation.
+(`transforms.json`). This renders both lit PBR previews and unlit material channels
+for aligned evaluation.
 """
 
 import argparse
+import contextlib
 import csv
 import json
 import os
@@ -31,12 +32,32 @@ def log(msg: str) -> None:
     print(f"[Render Gen] {msg}")
 
 
+@contextlib.contextmanager
+def suppress_render_output() -> Any:
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    old_stdout = os.dup(1)
+    try:
+        os.dup2(devnull, 1)
+        yield
+    finally:
+        os.dup2(old_stdout, 1)
+        os.close(devnull)
+        os.close(old_stdout)
+
+
 def resolve_path(path: str, base_dir: str) -> str:
     if not path:
         return ""
     if os.path.isabs(path):
         return path
     return os.path.abspath(os.path.join(base_dir, path))
+
+
+def find_normal_path(explicit_normal: str, fallback_from: str) -> str:
+    _ = fallback_from
+    if explicit_normal and os.path.exists(explicit_normal):
+        return explicit_normal
+    return ""
 
 
 def set_color_management(scene: bpy.types.Scene) -> None:
@@ -227,6 +248,40 @@ def build_emission_material(name: str, image_path: str, colorspace: str) -> bpy.
     return mat
 
 
+def build_world_normal_material(name: str, image_path: str) -> bpy.types.Material:
+    """Builds an emission material that outputs world-space normals remapped to [0, 1]."""
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    for n in list(nodes):
+        nodes.remove(n)
+
+    tex = nodes.new("ShaderNodeTexImage")
+    tex.image = bpy.data.images.load(image_path)
+    tex.image.colorspace_settings.name = "Non-Color"
+    tex.interpolation = "Smart"
+
+    nrm = nodes.new("ShaderNodeNormalMap")
+    nrm.space = "TANGENT"
+
+    vec = nodes.new("ShaderNodeVectorMath")
+    vec.operation = "MULTIPLY_ADD"
+    vec.inputs[1].default_value = (0.5, 0.5, 0.5)
+    vec.inputs[2].default_value = (0.5, 0.5, 0.5)
+
+    emis = nodes.new("ShaderNodeEmission")
+    emis.inputs["Strength"].default_value = 1.0
+
+    out = nodes.new("ShaderNodeOutputMaterial")
+
+    links.new(tex.outputs["Color"], nrm.inputs["Color"])
+    links.new(nrm.outputs["Normal"], vec.inputs[0])
+    links.new(vec.outputs["Vector"], emis.inputs["Color"])
+    links.new(emis.outputs["Emission"], out.inputs["Surface"])
+    return mat
+
+
 def build_pbr_material(albedo: str, rough: str, metal: str, normal: str) -> bpy.types.Material:
     mat = bpy.data.materials.new(name="PBR_MATERIAL")
     mat.use_nodes = True
@@ -258,6 +313,7 @@ def build_pbr_material(albedo: str, rough: str, metal: str, normal: str) -> bpy.
     if metal:
         mtl = add_tex(metal, "Non-Color", -200)
         links.new(mtl.outputs["Color"], bsdf.inputs["Metallic"])
+
     if normal:
         nrm_tex = add_tex(normal, "Non-Color", -400)
         nrm_node = nodes.new("ShaderNodeNormalMap")
@@ -276,17 +332,20 @@ def build_geometry_normal_material(name: str) -> bpy.types.Material:
     for n in list(nodes):
         nodes.remove(n)
 
-    # Fallback for missing normal map:
-    # Output Tangent Space Identity Normal (0.5, 0.5, 1.0)
-    # This ensures compatibility with GT normal maps (which are in tangent space)
-    # for metric computation (PSNR/SSIM).
-    
+    # Fallback for missing normal map: output world-space geometry normals in [0, 1].
+    geo = nodes.new("ShaderNodeNewGeometry")
+    vec = nodes.new("ShaderNodeVectorMath")
+    vec.operation = "MULTIPLY_ADD"
+    vec.inputs[1].default_value = (0.5, 0.5, 0.5)
+    vec.inputs[2].default_value = (0.5, 0.5, 0.5)
+
     emis = nodes.new("ShaderNodeEmission")
-    emis.inputs["Color"].default_value = (0.5, 0.5, 1.0, 1.0)
     emis.inputs["Strength"].default_value = 1.0
     
     out = nodes.new("ShaderNodeOutputMaterial")
     
+    links.new(geo.outputs["Normal"], vec.inputs[0])
+    links.new(vec.outputs["Vector"], emis.inputs["Color"])
     links.new(emis.outputs["Emission"], out.inputs["Surface"])
     return mat
 
@@ -375,7 +434,10 @@ def frame_basename(frame: Dict[str, Any], idx: int) -> str:
     if frame.get("file_prefix"):
         return str(frame["file_prefix"])
     if frame.get("file_name"):
-        return os.path.splitext(os.path.basename(frame["file_name"]))[0]
+        base = os.path.splitext(os.path.basename(frame["file_name"]))[0]
+        if base.endswith("_beauty"):
+            return base[:-7]
+        return base
     return f"{idx:03d}"
 
 
@@ -405,11 +467,16 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
     albedo = row.get("albedo")
     rough = row.get("rough") or row.get("roughness")
     metal = row.get("metal") or row.get("metallic")
-    normal = row.get("normal")
+    normal = find_normal_path(row.get("normal"), albedo or mesh_path)
 
     transform_path = row.get("transforms")
     if not transform_path:
-        transform_path = os.path.join(args.gt_root, args.transforms_subdir, oid, "transforms.json")
+        if args.transforms_subdir:
+            legacy_path = os.path.join(args.gt_root, args.transforms_subdir, oid, "transforms.json")
+            nested_path = os.path.join(args.gt_root, oid, args.transforms_subdir, "transforms.json")
+            transform_path = legacy_path if os.path.exists(legacy_path) else nested_path
+        else:
+            transform_path = os.path.join(args.gt_root, oid, "transforms.json")
 
     if not mesh_path or not os.path.exists(mesh_path):
         log(f"{oid}: mesh missing or not found.")
@@ -434,104 +501,139 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
         lens_mm = float(intrinsics["fx"]) * sensor_width / float(width)
     lens_mm = float(lens_mm) if lens_mm is not None else args.fallback_focal
 
-    samples = 1 if args.mode == "unlit" else args.samples
-    scene = reset_scene(width, height, samples)
-    
-    try:
-        setup_background(scene, args.background, args.hdri, args.hdri_strength)
-    except Exception as e:
-        log(f"{oid}: background setup failed ({e}), skip.")
-        return False
+    obj_root = os.path.join(args.out_root, oid)
+    lit_dir = os.path.join(obj_root, "lit")
+    unlit_dir = os.path.join(obj_root, "unlit")
 
-    mesh_obj = import_and_normalize(mesh_path)
-    if not mesh_obj:
-        log(f"{oid}: import/normalize failed.")
-        return False
-
-    def usable(path: str) -> str:
-        return path if path and os.path.exists(path) else ""
-
-    albedo = usable(albedo)
-    rough = usable(rough)
-    metal = usable(metal)
-    normal = usable(normal)
-    if args.mode == "beauty" and not albedo:
-        log(f"{oid}: beauty mode requires an albedo texture.")
-        return False
-
-    if args.mode == "beauty":
-        mat_beauty = build_pbr_material(albedo, rough, metal, normal)
-    else:
-        tex_map = {
-            "albedo": albedo,
-            "rough": rough,
-            "metal": metal,
-            "normal": normal,
-        }
-        emission_mats = {}
-        for name, cs in PASS_CONFIG:
-            path = tex_map.get(name)
-            if path and os.path.exists(path):
-                emission_mats[name] = build_emission_material(f"{name.upper()}_EMIT", path, cs)
-            elif name == "normal":
-                emission_mats[name] = build_geometry_normal_material(f"{name.upper()}_GEO")
-            else:
-                emission_mats[name] = None
-
-    cam = create_camera(scene, lens_mm)
-    validate_intrinsics(cam, scene, intrinsics, oid)
-
-    sub_dir = "eval_lit" if args.mode == "beauty" else "train_unlit"
-    out_dir = os.path.join(args.out_root, sub_dir, oid)
-    os.makedirs(out_dir, exist_ok=True)
-
+    frame_data: List[Tuple[int, Dict[str, Any], Matrix, str]] = []
     for idx, frame in enumerate(frames):
         try:
             w2c = to_matrix(frame["world_to_camera"])
         except Exception as e:
             log(f"{oid}: invalid world_to_camera at frame {idx} ({e})")
             continue
+        base = frame_basename(frame, idx)
+        frame_data.append((idx, frame, w2c, base))
 
+    if not frame_data:
+        log(f"{oid}: no valid frames to render.")
+        return False
+
+    _, last_frame, _, last_base = frame_data[-1]
+    lit_name = last_frame.get("file_name") or f"{last_base}_beauty.png"
+    images = last_frame.get("images") or {}
+    unlit_names = {
+        name: images.get(name) or f"{last_base}_{name}.png" for name, _ in PASS_CONFIG
+    }
+    lit_done = os.path.exists(os.path.join(lit_dir, lit_name))
+    unlit_done = all(os.path.exists(os.path.join(unlit_dir, fname)) for fname in unlit_names.values())
+    if lit_done and unlit_done:
+        log(f"{oid}: found existing renders, skip.")
+        return True
+
+    scene = reset_scene(width, height, args.samples)
+    mesh_obj = import_and_normalize(mesh_path)
+    if not mesh_obj:
+        log(f"{oid}: import/normalize failed.")
+        return False
+
+    def require_texture(name: str, path: str) -> bool:
+        if not path or not os.path.exists(path):
+            log(f"{oid}: {name} texture missing or not found.")
+            return False
+        return True
+
+    if not require_texture("albedo", albedo):
+        return False
+    if not require_texture("rough", rough):
+        return False
+    if not require_texture("metal", metal):
+        return False
+
+    normal_path = normal if normal and os.path.exists(normal) else ""
+    if not normal_path:
+        log(f"{oid}: normal map missing, using geometry normals for lit and unlit.")
+
+    mat_beauty = build_pbr_material(albedo, rough, metal, normal_path)
+    emission_mats: Dict[str, bpy.types.Material] = {}
+    for name, cs in PASS_CONFIG:
+        if name == "normal":
+            emission_mats[name] = (
+                build_world_normal_material(f"{name.upper()}_EMIT", normal_path)
+                if normal_path
+                else build_geometry_normal_material(f"{name.upper()}_GEO")
+            )
+            continue
+        path = {"albedo": albedo, "rough": rough, "metal": metal}.get(name)
+        if path and os.path.exists(path):
+            emission_mats[name] = build_emission_material(f"{name.upper()}_EMIT", path, cs)
+        else:
+            log(f"{oid}: {name} texture missing for unlit render.")
+            return False
+
+    cam = create_camera(scene, lens_mm)
+    validate_intrinsics(cam, scene, intrinsics, oid)
+
+    os.makedirs(lit_dir, exist_ok=True)
+    os.makedirs(unlit_dir, exist_ok=True)
+
+    def apply_camera(w2c: Matrix, idx: int) -> bool:
         try:
             cam.matrix_world = w2c.inverted()
         except Exception as e:
             log(f"{oid}: failed to invert w2c at frame {idx} ({e})")
-            continue
-
+            return False
         bpy.context.view_layer.update()
-
         restored_w2c = cam.matrix_world.inverted()
         diff = max(abs(restored_w2c[i][j] - w2c[i][j]) for i in range(4) for j in range(4))
         if diff > 1e-4:
             log(f"{oid}: w2c mismatch at frame {idx}, max diff {diff:.6f}")
+        return True
 
-        base = frame_basename(frame, idx)
-        if args.mode == "beauty":
-            mesh_obj.data.materials.clear()
-            mesh_obj.data.materials.append(mat_beauty)
-            out_name = frame.get("file_name") or f"{base}_beauty.png"
-            scene.render.filepath = os.path.join(out_dir, out_name)
+    # Lit pass
+    scene.cycles.samples = args.samples
+    try:
+        setup_background(scene, args.background, args.hdri, args.hdri_strength)
+    except Exception as e:
+        log(f"{oid}: background setup failed ({e}), skip.")
+        return False
+    mesh_obj.data.materials.clear()
+    mesh_obj.data.materials.append(mat_beauty)
+    for idx, frame, w2c, base in frame_data:
+        if not apply_camera(w2c, idx):
+            continue
+        out_name = frame.get("file_name") or f"{base}_beauty.png"
+        scene.render.filepath = os.path.join(lit_dir, out_name)
+        with suppress_render_output():
             bpy.ops.render.render(write_still=True)
-        else:
-            for pass_name, _ in PASS_CONFIG:
-                mat = emission_mats.get(pass_name)
-                if mat is None:
-                    continue
-                mesh_obj.data.materials.clear()
-                mesh_obj.data.materials.append(mat)
-                out_name = f"{base}_{pass_name}.png"
-                scene.render.filepath = os.path.join(out_dir, out_name)
+
+    # Unlit pass (emission)
+    scene.cycles.samples = 1
+    setup_background(scene, "transparent", "", 0.0)
+    for idx, frame, w2c, base in frame_data:
+        if not apply_camera(w2c, idx):
+            continue
+        images = frame.get("images") or {}
+        for pass_name, _ in PASS_CONFIG:
+            mat = emission_mats.get(pass_name)
+            if mat is None:
+                continue
+            mesh_obj.data.materials.clear()
+            mesh_obj.data.materials.append(mat)
+            out_name = images.get(pass_name) or f"{base}_{pass_name}.png"
+            scene.render.filepath = os.path.join(unlit_dir, out_name)
+            with suppress_render_output():
                 bpy.ops.render.render(write_still=True)
 
     if args.save_blend:
-        blend_path = os.path.join(out_dir, "scene.blend")
+        blend_path = os.path.join(obj_root, "scene.blend")
         try:
             bpy.ops.wm.save_mainfile(filepath=blend_path)
             log(f"{oid}: saved blend to {blend_path}")
         except Exception as e:
             log(f"{oid}: failed to save blend file ({e})")
 
-    log(f"{oid}: rendered to {out_dir}")
+    log(f"{oid}: rendered to {obj_root}")
     return True
 
 
@@ -547,13 +649,19 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render generated assets with GT camera poses (transforms.json).")
     parser.add_argument("--manifest", required=True, help="TSV manifest with columns: obj_id, mesh, albedo[, rough, metal, normal, transforms].")
     parser.add_argument("--gt-root", required=True, help="GT render root containing transforms (e.g., datasets/texverse_rendered).")
-    parser.add_argument("--transforms-subdir", default="eval_lit", help="Subfolder under gt-root that stores transforms.json (eval_lit or train_unlit).")
+    parser.add_argument(
+        "--transforms-subdir",
+        default="",
+        help=(
+            "Optional subfolder for transforms.json. "
+            "Checks {gt-root}/{subdir}/{obj_id}/transforms.json first, then {gt-root}/{obj_id}/{subdir}/transforms.json."
+        ),
+    )
     parser.add_argument("--out-root", required=True, help="Where rendered images will be saved (per obj_id subfolder).")
-    parser.add_argument("--mode", choices=["beauty", "unlit"], default="beauty", help="beauty=Principled + HDRI; unlit=per-map emission.")
-    parser.add_argument("--hdri", default="", help="HDRI path (required for beauty mode).")
-    parser.add_argument("--hdri-strength", type=float, default=1.0, help="HDRI intensity for beauty mode.")
-    parser.add_argument("--samples", type=int, default=64, help="Cycles samples for beauty mode (unlit always uses 1).")
-    parser.add_argument("--background", choices=["black", "white", "hdri", "transparent"], default=None, help="Background mode.")
+    parser.add_argument("--hdri", default="", help="HDRI path (required for lit renders).")
+    parser.add_argument("--hdri-strength", type=float, default=1.0, help="HDRI intensity for lit renders.")
+    parser.add_argument("--samples", type=int, default=64, help="Cycles samples for lit renders (unlit uses 1).")
+    parser.add_argument("--background", choices=["black", "white", "hdri", "transparent"], default=None, help="Background mode for lit renders.")
     parser.add_argument("--fallback-focal", type=float, default=50.0, help="Fallback focal length (mm) if transforms.json lacks focal metadata.")
     parser.add_argument("--save-blend", action="store_true", help="Save a .blend per object for debugging.")
     return parser.parse_args(argv)
@@ -567,10 +675,13 @@ def main(argv: List[str]) -> None:
     manifest_dir = os.path.dirname(manifest_path)
 
     if args.background is None:
-        args.background = "hdri" if args.mode == "beauty" else "transparent"
+        args.background = "hdri"
 
     if not os.path.exists(manifest_path):
         log(f"Manifest not found: {manifest_path}")
+        return
+    if not args.hdri or not os.path.exists(args.hdri):
+        log("Lit renders require a valid --hdri path.")
         return
 
     with open(manifest_path, "r", encoding="utf-8") as f:

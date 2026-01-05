@@ -3,7 +3,7 @@
 # ========================================================
 # 脚本名称: render_gen_aligned.sh
 # 功能: 读取 GT 渲染时保存的 transforms.json，相同视角渲染生成的贴图/模型
-# 模式: 支持 beauty（PBR+HDRI）和 unlit（各贴图 emission），默认 beauty
+# 模式: 统一输出 lit（PBR+HDRI）和 unlit（各贴图 emission）
 # 需要: manifest.tsv 至少包含 obj_id、mesh、albedo，可选 rough/metal/normal/transforms
 # ========================================================
 
@@ -19,23 +19,22 @@ conda activate blender
 # 生成结果的 manifest（路径支持相对路径）
 MANIFEST_PATH="../experiments/exp003_test_batch/generated_manifest.tsv"
 
-# GT 渲染结果根目录（内部包含 eval_lit/train_unlit/.../transforms.json）
-GT_ROOT="../datasets/texverse_rendered"
-TRANSFORMS_SUBDIR="eval_lit"   # 如果想用训练相机，改成 train_unlit
+# GT 渲染结果根目录（内部包含 {obj_id}/transforms.json）
+GT_ROOT="../datasets/texverse_rendered/test"
+TRANSFORMS_SUBDIR=""   # 可选：如果 transforms 在子目录内，设置该值
 
 # 输出目录
 OUT_ROOT="../experiments/exp003_test_batch/texverse_gen_renders"
 
-# HDRI（beauty 模式必需，unlit 可忽略）
+# HDRI（lit 渲染必需）
 HDRI_PATH="../datasets/hdri/rogland_sunset_4k.exr"
 
 echo "=============================================="
 echo "Render Generated Assets with GT Cameras"
 echo "Manifest:   $MANIFEST_PATH"
-echo "GT Root:    $GT_ROOT/$TRANSFORMS_SUBDIR"
-echo "Output:     $OUT_ROOT"
+echo "GT Root:    $GT_ROOT"
+echo "Output:     $OUT_ROOT/{obj_id}/(lit|unlit)"
 echo "HDRI:       $HDRI_PATH"
-echo "Mode:       beauty"
 echo "=============================================="
 
 # 3. 执行渲染
@@ -44,7 +43,6 @@ CUDA_VISIBLE_DEVICES=0 python ./scripts/render_gen_aligned.py \
   --gt-root "$GT_ROOT" \
   --transforms-subdir "$TRANSFORMS_SUBDIR" \
   --out-root "$OUT_ROOT" \
-  --mode beauty \
   --hdri "$HDRI_PATH" \
   --samples 64 \
   --hdri-strength 1.0 \
