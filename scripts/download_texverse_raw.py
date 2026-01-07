@@ -46,40 +46,36 @@ REQUIRED_META = ["metadata.json", "caption.json"]
 # 设定面数上限，避免显存溢出 (TexGaussian 建议)
 MAX_FACE_COUNT = 200000 
 
-GLUE_WORDS_PATTERN = re.compile(
-    r"\b(?:a|an|the|is|are|was|were|consists of|composed of|made of|features|featuring|"
-    r"positioned|located|placed|with|in|on|at|by|to|from|which|that)\b",
-    flags=re.IGNORECASE,
-)
-PREFIX_PATTERN = re.compile(
-    r"^\s*(?:3d model of|pbr material of|object representing)\s*",
-    flags=re.IGNORECASE,
-)
-
-def distill_caption(text: str) -> str:
-    """清洗与压缩描述文本，尽可能保留语义但去除冗余。"""
-    if text is None:
-        return ""
-    # 去前缀
-    text = re.sub(PREFIX_PATTERN, "", text)
-    # 去胶水词
-    text = re.sub(GLUE_WORDS_PATTERN, " ", text)
-    # 标点与换行处理
-    text = text.replace("\n", ",").replace(".", ",")
-    # 合并重复的逗号与空格
-    text = re.sub(r"[,\s]+", " ", text)
-    text = re.sub(r"\s*,\s*", ", ", text)
-    # 去除重复的逗号
-    text = re.sub(r"(,\s*){2,}", ", ", text)
-    # 收尾清理
-    return text.strip(" ,")
-
 def strict_validate(text: str):
     """严格校验文本长度，不允许截断；超长则抛错。"""
     try:
         tokenize(text)
     except RuntimeError as e:
         raise ValueError(f"Text too long for CLIP context: {text}") from e
+
+def parse_captions_natural(text: str) -> tuple[str, str]:
+    if text is None:
+        return "", ""
+    cleaned = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return "", ""
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+    sentences = [s for s in sentences if s]
+    if not sentences:
+        return "", ""
+    if len(sentences) >= 2:
+        short_caption = f"{sentences[0]} {sentences[1]}"
+    else:
+        short_caption = sentences[0]
+    return short_caption, cleaned
+
+def log_skip(log_f, obj_id, reason, detail=""):
+    message = f"SKIP\t{obj_id}\t{reason}"
+    if detail:
+        message += f"\t{detail}"
+    log_f.write(message + "\n")
+    log_f.flush()
 
 def validate_glb_strict(glb_path):
     """
@@ -129,10 +125,11 @@ def main():
     
     if not args.out_dir: args.out_dir = args.data_root
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    os.makedirs(args.data_root, exist_ok=True)
+    os.makedirs(args.out_dir, exist_ok=True)
     
     # 1. 确保元数据存在
     print(f"Checking metadata in {args.data_root}...")
-    os.makedirs(args.data_root, exist_ok=True)
     for fn in REQUIRED_META:
         if not os.path.exists(os.path.join(args.data_root, fn)):
             print(f"[Downloading] {fn}...")
@@ -148,93 +145,115 @@ def main():
     with open(os.path.join(args.data_root, "caption.json"), "r", encoding="utf-8") as f: 
         caps = json.load(f)
     
-    # 3. 筛选候选列表
-    candidates = []
-    print("Filtering candidates (Target: 1k, Metalness PBR)...")
-    
-    for obj_id, m in meta.items():
-        # A. PBR 类型筛选: TexGaussian 仅支持 Metalness 流程 [cite: 58, 190]
-        # JSON中 key 为 "pbrType"
-        pbr_type = m.get("pbrType")
-        if pbr_type != "metalness": 
-            continue
+    log_path = os.path.join(args.out_dir, "download_texverse_raw.log")
+    with open(log_path, "w", encoding="utf-8") as log_f:
+        log_f.write("event\tobj_id\treason\tdetail\n")
+
+        # 3. 筛选候选列表
+        candidates = []
+        print("Filtering candidates (Target: 1k, Metalness PBR)...")
+        
+        for obj_id, m in meta.items():
+            # A. PBR 类型筛选: TexGaussian 仅支持 Metalness 流程 [cite: 58, 190]
+            # JSON中 key 为 "pbrType"
+            pbr_type = m.get("pbrType")
+            if pbr_type != "metalness": 
+                continue
+                
+            # B. 寻找 1k 路径
+            paths = m.get("glb_paths", [])
+            target_path = None
+            for p in paths:
+                if "_1024.glb" in p: # 匹配 1k 文件名
+                    target_path = p
+                    break
             
-        # B. 寻找 1k 路径
-        paths = m.get("glb_paths", [])
-        target_path = None
-        for p in paths:
-            if "_1024.glb" in p: # 匹配 1k 文件名
-                target_path = p
+            if not target_path: 
+                continue
+            
+            # C. 获取 Caption
+            c_data = caps.get(obj_id)
+            if isinstance(c_data, dict): 
+                cap = c_data.get("material_desc") or c_data.get("caption")
+            else: 
+                cap = c_data
+            if cap is None or cap == "":
+                log_skip(log_f, obj_id, "empty caption")
+                continue
+            
+            # D. 面数筛选
+            face_count = m.get("faceCount", 0) or 0
+            if int(face_count) > MAX_FACE_COUNT: 
+                continue
+
+            candidates.append({
+                "obj_id": obj_id, 
+                "rel_glb": target_path, 
+                "caption": cap
+            })
+
+        random.seed(args.seed)
+        random.shuffle(candidates)
+        
+        # 4. 下载与校验
+        print(f"Start verifying... Candidates: {len(candidates)}, Target: {args.total_num}")
+        valid_list = []
+        
+        for item in candidates:
+            if len(valid_list) >= args.total_num: 
                 break
-        
-        if not target_path: continue
-        
-        # C. 获取 Caption
-        c_data = caps.get(obj_id)
-        if isinstance(c_data, dict): 
-            cap = c_data.get("material_desc") or c_data.get("caption")
-        else: 
-            cap = c_data
-        if not cap: continue
-        
-        # D. 面数筛选
-        face_count = m.get("faceCount", 0) or 0
-        if int(face_count) > MAX_FACE_COUNT: continue
 
-        candidates.append({
-            "obj_id": obj_id, 
-            "rel_glb": target_path, 
-            "caption": cap.replace("\n", " ").replace("\t", " ")
-        })
-
-    random.seed(args.seed)
-    random.shuffle(candidates)
-    
-    # 4. 下载与校验
-    print(f"Start verifying... Candidates: {len(candidates)}, Target: {args.total_num}")
-    valid_list = []
-    
-    for item in candidates:
-        if len(valid_list) >= args.total_num: break
-        
-        try:
-            # 下载具体文件
-            local_path = hf_hub_download(
-                repo_id=args.repo, repo_type="dataset", 
-                filename=item["rel_glb"], local_dir=args.data_root
-            )
+            short_caption, long_caption = parse_captions_natural(item["caption"])
+            if not short_caption or not long_caption:
+                log_skip(log_f, item["obj_id"], "empty caption")
+                continue
+            try:
+                strict_validate(short_caption)
+            except ValueError as e:
+                log_skip(log_f, item["obj_id"], "caption_short too long (tokenized)", str(e))
+                continue
+            except Exception as e:
+                log_skip(log_f, item["obj_id"], "caption_short validation error", str(e))
+                continue
             
-            # 严格校验
-            if validate_glb_strict(local_path):
-                try:
-                    cap_clean = distill_caption(item["caption"])
-                    strict_validate(cap_clean)
+            try:
+                # 下载具体文件
+                local_path = hf_hub_download(
+                    repo_id=args.repo, repo_type="dataset", 
+                    filename=item["rel_glb"], local_dir=args.data_root
+                )
+                
+                # 严格校验
+                if validate_glb_strict(local_path):
                     item_clean = {
                         "obj_id": item["obj_id"],
                         "rel_glb": item["rel_glb"],
-                        "caption": cap_clean,
+                        "caption_short": short_caption,
+                        "caption_long": long_caption,
                     }
                     valid_list.append(item_clean)
-                except ValueError as e:
-                    print(f"[Skip] {item['obj_id']} caption invalid: {e}")
-                if len(valid_list) % 10 == 0:
-                    print(f"Qualified: {len(valid_list)}/{args.total_num}")
-            else:
-                # 不合格则删除以节省空间
-                os.remove(local_path)
-                
-        except Exception as e:
-            print(f"[Fail] {item['obj_id']}: {e}")
+                    if len(valid_list) % 10 == 0:
+                        print(f"Qualified: {len(valid_list)}/{args.total_num}")
+                else:
+                    # 不合格则删除以节省空间
+                    try:
+                        os.remove(local_path)
+                    except FileNotFoundError:
+                        pass
+                    log_skip(log_f, item["obj_id"], "glb invalid", item["rel_glb"])
+                    
+            except Exception as e:
+                log_skip(log_f, item["obj_id"], "download fail", str(e))
+                print(f"[Fail] {item['obj_id']}: {e}")
 
-    # 5. 生成清单
-    os.makedirs(args.out_dir, exist_ok=True)
-    out_tsv = os.path.join(args.out_dir, "downloaded_manifest.tsv")
-    with open(out_tsv, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f, delimiter='\t')
-        writer.writerow(["rel_glb", "caption", "obj_id"])
-        for item in valid_list:
-            writer.writerow([item["rel_glb"], item["caption"], item["obj_id"]])
-            
+        # 5. 生成清单
+        out_tsv = os.path.join(args.out_dir, "downloaded_manifest.tsv")
+        with open(out_tsv, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, delimiter='\t')
+            writer.writerow(["rel_glb", "caption_short", "caption_long", "obj_id"])
+            for item in valid_list:
+                writer.writerow([item["rel_glb"], item["caption_short"], item["caption_long"], item["obj_id"]])
+                
     print(f"[Step 1 Done] Collected {len(valid_list)} valid Metalness models.")
     print(f"Manifest saved to {out_tsv}")
 
