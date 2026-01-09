@@ -128,11 +128,13 @@ def analyze_captions(file_path, output_path, max_plot, clip_limit, batch_size, u
     mean_s1 = sum(s1_counts) / len(s1_counts)
     mean_s12 = sum(s12_counts) / len(s12_counts)
     pct_trunc = 100.0 * sum(1 for c in s12_counts if c > clip_limit) / len(s12_counts)
+    max_full = max(full_counts)
 
     print(f"Token counter: {token_counter_name}")
     print(f"Mean S1: {mean_s1:.2f}")
     print(f"Mean S1+S2: {mean_s12:.2f}")
     print(f"Percentage of (S1+S2) > {clip_limit}: {pct_trunc:.2f}%")
+    print(f"Max Full: {max_full}")
 
     bins = np.linspace(0, max_plot, 61)
 
