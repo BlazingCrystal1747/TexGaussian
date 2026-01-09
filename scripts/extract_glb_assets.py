@@ -311,10 +311,21 @@ def main():
     skipped_count = 0
     
     tasks = []
+    extra_caption_fields = []
     try:
         with open(args.tsv, 'r', encoding='utf-8') as f_in:
             reader = csv.DictReader(f_in, delimiter='\t')
-            for row in reader: tasks.append(row)
+            fieldnames_in = reader.fieldnames or []
+            required_captions = ("caption_short", "caption_long")
+            missing = [name for name in required_captions if name not in fieldnames_in]
+            if missing:
+                log(f"Error: missing required caption columns: {', '.join(missing)}")
+                log(f"Available columns: {', '.join(fieldnames_in) if fieldnames_in else '(none)'}")
+                return
+            extra_caption_fields = list(required_captions)
+            log("Using caption columns: caption_short, caption_long")
+            for row in reader:
+                tasks.append(row)
     except Exception as e:
         log(f"Error reading TSV: {e}")
         return
@@ -324,15 +335,21 @@ def main():
 
     start_time = time.time()
 
+    out_fieldnames = ["obj_id", "caption_short", "caption_long"]
+    out_fieldnames.extend(["mesh", "albedo", "rough", "metal", "normal", "glb_path"])
+
     with open(manifest_out_path, 'w', newline='', encoding='utf-8') as f_out:
-        writer = csv.writer(f_out, delimiter='\t')
-        writer.writerow(["obj_id", "caption", "mesh", "albedo", "rough", "metal", "normal", "glb_path"])
+        writer = csv.DictWriter(f_out, fieldnames=out_fieldnames, delimiter='\t')
+        writer.writeheader()
         
         for i, row in enumerate(tasks):
             oid = row['obj_id']
             glb_rel = row.get('rel_glb', row.get('path', ''))
             glb_path = os.path.join(args.data_root, glb_rel)
             out_dir = os.path.join(args.out_root, oid)
+
+            caption_short = (row.get("caption_short") or "").strip()
+            caption_long = (row.get("caption_long") or "").strip()
             
             p_mesh = os.path.join(out_dir, "mesh.obj")
             p_albedo = os.path.join(out_dir, "albedo.png")
@@ -345,10 +362,18 @@ def main():
 
             if os.path.exists(p_mesh) and os.path.exists(p_albedo) and \
                os.path.exists(p_rough) and os.path.exists(p_metal) and os.path.exists(p_normal):
-                writer.writerow([oid, row['caption'], 
-                                 os.path.abspath(p_mesh), os.path.abspath(p_albedo), 
-                                 os.path.abspath(p_rough), os.path.abspath(p_metal), os.path.abspath(p_normal),
-                                 os.path.abspath(glb_path)])
+                row_out = {
+                    "obj_id": oid,
+                    "caption_short": caption_short,
+                    "caption_long": caption_long,
+                    "mesh": os.path.abspath(p_mesh),
+                    "albedo": os.path.abspath(p_albedo),
+                    "rough": os.path.abspath(p_rough),
+                    "metal": os.path.abspath(p_metal),
+                    "normal": os.path.abspath(p_normal),
+                    "glb_path": os.path.abspath(glb_path),
+                }
+                writer.writerow(row_out)
                 skipped_count += 1
                 continue
 
@@ -359,15 +384,18 @@ def main():
 
             try:
                 process_single_model(glb_path, out_dir)
-                writer.writerow([
-                    oid, row['caption'],
-                    os.path.abspath(p_mesh),
-                    os.path.abspath(p_albedo),
-                    os.path.abspath(p_rough),
-                    os.path.abspath(p_metal),
-                    os.path.abspath(p_normal),
-                    os.path.abspath(glb_path)
-                ])
+                row_out = {
+                    "obj_id": oid,
+                    "caption_short": caption_short,
+                    "caption_long": caption_long,
+                    "mesh": os.path.abspath(p_mesh),
+                    "albedo": os.path.abspath(p_albedo),
+                    "rough": os.path.abspath(p_rough),
+                    "metal": os.path.abspath(p_metal),
+                    "normal": os.path.abspath(p_normal),
+                    "glb_path": os.path.abspath(glb_path),
+                }
+                writer.writerow(row_out)
                 processed_count += 1
                 if processed_count % 10 == 0: f_out.flush()
                 

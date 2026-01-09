@@ -31,7 +31,7 @@ def main():
     # 输入：Step 2 生成的总表
     parser.add_argument("--manifest", 
                         default="../datasets/texverse_extracted/manifest_extracted.tsv", 
-                        help="Path to the extracted manifest from Step 2 (for obj_id/mesh/caption).")
+                        help="Path to the extracted manifest from Step 2 (expects caption_short/long).")
 
     # 输出：默认放在 experiments/common_splits，作为所有实验的公共参考
     parser.add_argument("--out-dir", 
@@ -66,7 +66,7 @@ def main():
 
     # ================= 2. 读取并校验数据 =================
     valid_data = []
-    caption_col = None
+    fieldnames_in = []
 
     print(f"Reading and validating data...")
     try:
@@ -87,7 +87,13 @@ def main():
             if mesh_col is None or albedo_col is None or rough_col is None or metal_col is None or normal_col is None:
                 print("[Error] Manifest missing required texture columns (need mesh/albedo/rough/metal/normal).")
                 return
-            caption_col = "caption" if "caption" in fieldnames_in else None
+            required_captions = ("caption_short", "caption_long")
+            missing = [name for name in required_captions if name not in fieldnames_in]
+            if missing:
+                print(f"[Error] Manifest missing required caption columns: {', '.join(missing)}")
+                print(f"Available columns: {', '.join(fieldnames_in) if fieldnames_in else '(none)'}")
+                return
+            print("Using caption columns: caption_short, caption_long")
 
             for row in reader:
                 oid = row.get("obj_id")
@@ -114,17 +120,24 @@ def main():
                     "metal": metal_path,
                     "normal": normal_path,
                 }
-                if caption_col:
-                    entry["caption"] = row.get(caption_col, "")
+                entry["caption_short"] = row.get("caption_short", "")
+                entry["caption_long"] = row.get("caption_long", "")
                 valid_data.append(entry)
 
     except Exception as e:
         print(f"[Error] Failed to read manifest: {e}")
         return
 
-    out_fieldnames = ["obj_id", "mesh", "albedo", "rough", "metal", "normal"]
-    if caption_col:
-        out_fieldnames.append("caption")
+    out_fieldnames = [
+        "obj_id",
+        "mesh",
+        "albedo",
+        "rough",
+        "metal",
+        "normal",
+        "caption_short",
+        "caption_long",
+    ]
 
     total = len(valid_data)
     print(f"Total valid samples: {total}")
