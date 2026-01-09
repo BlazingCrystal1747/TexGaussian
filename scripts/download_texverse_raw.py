@@ -13,6 +13,7 @@ import random
 import csv
 import struct
 import re
+import inspect
 
 # 确保能找到 repo 根目录下的 external.clip
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -46,12 +47,135 @@ REQUIRED_META = ["metadata.json", "caption.json"]
 # 设定面数上限，避免显存溢出 (TexGaussian 建议)
 MAX_FACE_COUNT = 200000 
 
+DEFAULT_CONTEXT_LENGTH = 77
+
+def _tokenize_supports(param_name: str) -> bool:
+    try:
+        return param_name in inspect.signature(tokenize).parameters
+    except (TypeError, ValueError):
+        return False
+
+def _get_context_length_default() -> int:
+    try:
+        sig = inspect.signature(tokenize)
+    except (TypeError, ValueError):
+        return DEFAULT_CONTEXT_LENGTH
+    param = sig.parameters.get("context_length")
+    if param and param.default is not inspect._empty:
+        try:
+            return int(param.default)
+        except (TypeError, ValueError):
+            return DEFAULT_CONTEXT_LENGTH
+    return DEFAULT_CONTEXT_LENGTH
+
+def _build_tokenize_kwargs(context_length: int) -> dict:
+    kwargs = {}
+    if _tokenize_supports("context_length"):
+        kwargs["context_length"] = context_length
+    if _tokenize_supports("truncate"):
+        kwargs["truncate"] = False
+    return kwargs
+
+def _tokenize_list(text: str, context_length: int):
+    kwargs = _build_tokenize_kwargs(context_length)
+    if kwargs:
+        try:
+            return tokenize([text], **kwargs)
+        except TypeError:
+            if "context_length" in kwargs:
+                kwargs_no_ctx = dict(kwargs)
+                kwargs_no_ctx.pop("context_length", None)
+                if kwargs_no_ctx:
+                    return tokenize([text], **kwargs_no_ctx)
+    try:
+        return tokenize([text], truncate=False)
+    except TypeError:
+        return tokenize([text])
+
+def _first_token_sequence(tokens):
+    if hasattr(tokens, "tolist"):
+        tokens = tokens.tolist()
+    if isinstance(tokens, (list, tuple)):
+        if tokens and isinstance(tokens[0], (list, tuple)):
+            return list(tokens[0])
+        return list(tokens)
+    return None
+
+def _token_length_from_internal_tokenizer(text: str):
+    try:
+        globals_dict = tokenize.__globals__
+    except AttributeError:
+        return None
+    tokenizer = globals_dict.get("_tokenizer") or globals_dict.get("tokenizer")
+    if tokenizer and hasattr(tokenizer, "encode"):
+        try:
+            return len(tokenizer.encode(text)) + 2
+        except Exception:
+            return None
+    return None
+
+def _get_eot_token_id(context_length: int):
+    try:
+        tokens_empty = _tokenize_list("", context_length)
+    except Exception:
+        return None
+    seq = _first_token_sequence(tokens_empty)
+    if not seq or len(seq) < 2:
+        return None
+    return seq[1]
+
+def _infer_token_length(text: str, tokens, context_length: int):
+    token_length = _token_length_from_internal_tokenizer(text)
+    if token_length is not None:
+        return token_length
+    seq = _first_token_sequence(tokens)
+    if not seq:
+        return None
+    if len(seq) != context_length:
+        return len(seq)
+    eot_id = _get_eot_token_id(context_length)
+    if eot_id is not None:
+        try:
+            eot_index = seq.index(eot_id)
+        except ValueError:
+            eot_index = None
+        if eot_index is not None and eot_index < context_length - 1:
+            return eot_index + 1
+    if not _tokenize_supports("context_length"):
+        return None
+    expanded_length = max(context_length + 1, 256)
+    try:
+        expanded_tokens = _tokenize_list(text, expanded_length)
+    except RuntimeError:
+        return expanded_length + 1
+    except Exception:
+        return None
+    expanded_seq = _first_token_sequence(expanded_tokens)
+    if not expanded_seq or len(expanded_seq) != expanded_length:
+        return None
+    eot_id = _get_eot_token_id(expanded_length) or eot_id
+    if eot_id is None:
+        return None
+    try:
+        expanded_eot_index = expanded_seq.index(eot_id)
+    except ValueError:
+        return None
+    return expanded_eot_index + 1
+
 def strict_validate(text: str):
     """严格校验文本长度，不允许截断；超长则抛错。"""
     try:
-        tokenize(text)
+        context_length = _get_context_length_default()
+        tokens = _tokenize_list(text, context_length)
     except RuntimeError as e:
-        raise ValueError(f"Text too long for CLIP context: {text}") from e
+        raise ValueError("caption_short too long after tokenization") from e
+    except Exception as e:
+        raise RuntimeError(f"caption_short tokenization failed: {e}") from e
+    token_length = _infer_token_length(text, tokens, context_length)
+    if token_length is None:
+        raise RuntimeError("caption_short token length unavailable; refusing to truncate")
+    if token_length > context_length:
+        raise ValueError("caption_short too long after tokenization")
 
 def parse_captions_natural(text: str) -> tuple[str, str]:
     if text is None:
@@ -60,8 +184,7 @@ def parse_captions_natural(text: str) -> tuple[str, str]:
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if not cleaned:
         return "", ""
-    sentences = re.split(r"(?<=[.!?])\s+", cleaned)
-    sentences = [s for s in sentences if s]
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", cleaned) if s.strip()]
     if not sentences:
         return "", ""
     if len(sentences) >= 2:
