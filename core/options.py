@@ -63,6 +63,10 @@ class Options:
 
     ### texture baking
     text_prompt: str = ''
+    caption_field: str = 'caption_short'
+    tsv_path: Optional[str] = None
+    batch_path: Optional[str] = None
+    result_tsv: Optional[str] = None
     texture_cam_radius: float = 4.5
     texture_name: str = 'test'
     save_image: str = 'False'

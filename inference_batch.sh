@@ -15,7 +15,7 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}"
 # ================= 配置区 =================
 
 # 实验名称 (将作为文件夹名创建在 experiments 下)
-EXP_NAME="exp001_test_batch"
+EXP_NAME="exp003_test_batch_short"
 
 # TSV 路径 (建议绝对路径，或相对于 texGaussian 的路径)
 BATCH_TSV="../experiments/common_splits/test.tsv"
@@ -24,15 +24,20 @@ BATCH_TSV="../experiments/common_splits/test.tsv"
 # 假设脚本在 project_root/texGaussian 下运行
 OUTPUT_ROOT="../experiments/${EXP_NAME}"
 
+# 文本字段（caption_short 或 caption_long）
+CAPTION_FIELD="caption_short"
+
 # ==========================================
 
 echo "Starting Batch Inference..."
 echo "Config: ${BATCH_TSV}"
 echo "Output: ${OUTPUT_ROOT}"
+echo "Caption: ${CAPTION_FIELD}"
 echo "Textures will be stored under: ${OUTPUT_ROOT}/textures"
 
 CUDA_VISIBLE_DEVICES=0 python3 texture.py objaverse \
---tsv_path "${BATCH_TSV}" \
+--tsv-path "${BATCH_TSV}" \
+--caption-field "${CAPTION_FIELD}" \
 --ckpt_path ./assets/ckpts/PBR_model.safetensors \
 --output_dir "${OUTPUT_ROOT}" \
 --save_image False

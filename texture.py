@@ -432,12 +432,25 @@ class Converter(nn.Module):
             kiui.write_image(os.path.join(save_dir, 'metallic.png'), metallic)
             kiui.write_image(os.path.join(save_dir, 'roughness.png'), roughness)
 
-def load_batch_from_tsv(tsv_path: str):
+def load_batch_from_tsv(tsv_path: str, caption_field: str):
     if not os.path.isfile(tsv_path):
         raise FileNotFoundError(f"TSV file not found: {tsv_path}")
 
     with open(tsv_path, "r", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
+        fieldnames = reader.fieldnames or []
+        required_captions = ("caption_short", "caption_long")
+        missing = [name for name in required_captions if name not in fieldnames]
+        if missing:
+            raise ValueError(
+                f"TSV missing required caption columns: {', '.join(missing)} "
+                f"(available: {', '.join(fieldnames) if fieldnames else '(none)'})"
+            )
+        if caption_field not in fieldnames:
+            raise ValueError(
+                f"TSV missing caption_field '{caption_field}' "
+                f"(available: {', '.join(fieldnames) if fieldnames else '(none)'})"
+            )
         rows = [row for row in reader]
 
     return rows
@@ -550,8 +563,9 @@ if __name__ == "__main__":
 
     if opt.tsv_path:
         tsv_dir = os.path.dirname(os.path.abspath(opt.tsv_path))
-        batch_rows = load_batch_from_tsv(opt.tsv_path)
+        batch_rows = load_batch_from_tsv(opt.tsv_path, opt.caption_field)
         print(f"[INFO] Loaded {len(batch_rows)} rows from {opt.tsv_path}")
+        print(f"[INFO] Using caption field: {opt.caption_field}")
         os.makedirs(textures_dir, exist_ok=True)
 
         processed_samples = []
@@ -559,7 +573,7 @@ if __name__ == "__main__":
 
         for idx, row in enumerate(batch_rows):
             mesh_path = (row.get("mesh") or "").strip()
-            caption = (row.get("caption") or "").strip()
+            caption = (row.get(opt.caption_field) or "").strip()
             obj_id = (row.get("obj_id") or "").strip() or f"sample_{idx}"
 
             if not mesh_path or not caption:
