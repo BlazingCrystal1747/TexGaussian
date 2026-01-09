@@ -11,7 +11,7 @@ conda activate "$ENV_NAME"
 
 # 默认参数，可通过环境变量或位置参数覆盖
 # 位置参数: $1=EXPERIMENT_NAME, $2=METRICS(可选，优先级最高)
-EXPERIMENT_NAME="${1:-exp003_test_batch}"
+EXPERIMENT_NAME="${1:-exp003_test_batch_short}"
 BASE_GT_DIR="${BASE_GT_DIR:-"../datasets/texverse_rendered/test"}"
 BASE_GEN_DIR="${BASE_GEN_DIR:-"../experiments/${EXPERIMENT_NAME}/texverse_gen_renders"}"
 LIT_SUBDIR="${LIT_SUBDIR:-"lit"}"
