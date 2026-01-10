@@ -21,6 +21,10 @@ _REPO_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+_LONGCLIP_ROOT = os.path.abspath(os.path.join(_REPO_ROOT, "third_party", "Long-CLIP"))
+if os.path.isdir(_LONGCLIP_ROOT) and _LONGCLIP_ROOT not in sys.path:
+    sys.path.insert(0, _LONGCLIP_ROOT)
+
 # 兼容 packaging 新版本不自动暴露 version 属性的问题
 try:
     import packaging
@@ -36,6 +40,28 @@ except ImportError:
     print("Error: clip (external.clip.tokenize) not found. Please ensure CLIP is installed and accessible.")
     sys.exit(1)
 
+def _resolve_longclip_module():
+    last_exc = None
+    try:
+        import longclip as longclip_module
+        return longclip_module
+    except Exception as exc:
+        last_exc = exc
+    try:
+        from model import longclip as longclip_module
+        return longclip_module
+    except Exception as exc:
+        last_exc = exc
+    raise ImportError(
+        "longclip is not available; install longclip or ensure third_party/Long-CLIP is present"
+    ) from last_exc
+
+try:
+    longclip_module = _resolve_longclip_module()
+except ImportError:
+    print(f"Error: LongCLIP not found. Please ensure {_LONGCLIP_ROOT} exists and is accessible.")
+    sys.exit(1)
+
 try:
     from huggingface_hub import hf_hub_download
 except ImportError:
@@ -48,49 +74,54 @@ REQUIRED_META = ["metadata.json", "caption.json"]
 MAX_FACE_COUNT = 200000 
 
 DEFAULT_CONTEXT_LENGTH = 77
+DEFAULT_LONGCLIP_CONTEXT_LENGTH = 248
 
-def _tokenize_supports(param_name: str) -> bool:
+def _tokenize_supports(tokenize_fn, param_name: str) -> bool:
     try:
-        return param_name in inspect.signature(tokenize).parameters
+        return param_name in inspect.signature(tokenize_fn).parameters
     except (TypeError, ValueError):
         return False
 
-def _get_context_length_default() -> int:
+def _get_context_length_default(tokenize_fn, fallback: int) -> int:
     try:
-        sig = inspect.signature(tokenize)
+        sig = inspect.signature(tokenize_fn)
     except (TypeError, ValueError):
-        return DEFAULT_CONTEXT_LENGTH
+        return fallback
     param = sig.parameters.get("context_length")
     if param and param.default is not inspect._empty:
         try:
             return int(param.default)
         except (TypeError, ValueError):
-            return DEFAULT_CONTEXT_LENGTH
-    return DEFAULT_CONTEXT_LENGTH
+            return fallback
+    return fallback
 
-def _build_tokenize_kwargs(context_length: int) -> dict:
+def _build_tokenize_kwargs(tokenize_fn, context_length: int) -> dict:
     kwargs = {}
-    if _tokenize_supports("context_length"):
+    if _tokenize_supports(tokenize_fn, "context_length"):
         kwargs["context_length"] = context_length
-    if _tokenize_supports("truncate"):
+    if _tokenize_supports(tokenize_fn, "truncate"):
         kwargs["truncate"] = False
     return kwargs
 
-def _tokenize_list(text: str, context_length: int):
-    kwargs = _build_tokenize_kwargs(context_length)
+def _tokenize_list(tokenize_fn, text: str, context_length: int, require_context_length: bool = False):
+    if require_context_length and not _tokenize_supports(tokenize_fn, "context_length"):
+        raise RuntimeError("tokenize does not support context_length; refusing to fall back")
+    kwargs = _build_tokenize_kwargs(tokenize_fn, context_length)
     if kwargs:
         try:
-            return tokenize([text], **kwargs)
-        except TypeError:
+            return tokenize_fn([text], **kwargs)
+        except TypeError as exc:
+            if require_context_length:
+                raise RuntimeError("tokenize does not accept context_length; refusing to fall back") from exc
             if "context_length" in kwargs:
                 kwargs_no_ctx = dict(kwargs)
                 kwargs_no_ctx.pop("context_length", None)
                 if kwargs_no_ctx:
-                    return tokenize([text], **kwargs_no_ctx)
+                    return tokenize_fn([text], **kwargs_no_ctx)
     try:
-        return tokenize([text], truncate=False)
+        return tokenize_fn([text], truncate=False)
     except TypeError:
-        return tokenize([text])
+        return tokenize_fn([text])
 
 def _first_token_sequence(tokens):
     if hasattr(tokens, "tolist"):
@@ -101,9 +132,9 @@ def _first_token_sequence(tokens):
         return list(tokens)
     return None
 
-def _token_length_from_internal_tokenizer(text: str):
+def _token_length_from_internal_tokenizer(tokenize_fn, text: str):
     try:
-        globals_dict = tokenize.__globals__
+        globals_dict = tokenize_fn.__globals__
     except AttributeError:
         return None
     tokenizer = globals_dict.get("_tokenizer") or globals_dict.get("tokenizer")
@@ -114,9 +145,9 @@ def _token_length_from_internal_tokenizer(text: str):
             return None
     return None
 
-def _get_eot_token_id(context_length: int):
+def _get_eot_token_id(tokenize_fn, context_length: int, require_context_length: bool = False):
     try:
-        tokens_empty = _tokenize_list("", context_length)
+        tokens_empty = _tokenize_list(tokenize_fn, "", context_length, require_context_length=require_context_length)
     except Exception:
         return None
     seq = _first_token_sequence(tokens_empty)
@@ -124,8 +155,14 @@ def _get_eot_token_id(context_length: int):
         return None
     return seq[1]
 
-def _infer_token_length(text: str, tokens, context_length: int):
-    token_length = _token_length_from_internal_tokenizer(text)
+def _infer_token_length(
+    tokenize_fn,
+    text: str,
+    tokens,
+    context_length: int,
+    require_context_length: bool = False,
+):
+    token_length = _token_length_from_internal_tokenizer(tokenize_fn, text)
     if token_length is not None:
         return token_length
     seq = _first_token_sequence(tokens)
@@ -133,7 +170,7 @@ def _infer_token_length(text: str, tokens, context_length: int):
         return None
     if len(seq) != context_length:
         return len(seq)
-    eot_id = _get_eot_token_id(context_length)
+    eot_id = _get_eot_token_id(tokenize_fn, context_length, require_context_length=require_context_length)
     if eot_id is not None:
         try:
             eot_index = seq.index(eot_id)
@@ -141,11 +178,16 @@ def _infer_token_length(text: str, tokens, context_length: int):
             eot_index = None
         if eot_index is not None and eot_index < context_length - 1:
             return eot_index + 1
-    if not _tokenize_supports("context_length"):
+    if not _tokenize_supports(tokenize_fn, "context_length"):
         return None
     expanded_length = max(context_length + 1, 256)
     try:
-        expanded_tokens = _tokenize_list(text, expanded_length)
+        expanded_tokens = _tokenize_list(
+            tokenize_fn,
+            text,
+            expanded_length,
+            require_context_length=require_context_length,
+        )
     except RuntimeError:
         return expanded_length + 1
     except Exception:
@@ -153,7 +195,11 @@ def _infer_token_length(text: str, tokens, context_length: int):
     expanded_seq = _first_token_sequence(expanded_tokens)
     if not expanded_seq or len(expanded_seq) != expanded_length:
         return None
-    eot_id = _get_eot_token_id(expanded_length) or eot_id
+    eot_id = _get_eot_token_id(
+        tokenize_fn,
+        expanded_length,
+        require_context_length=require_context_length,
+    ) or eot_id
     if eot_id is None:
         return None
     try:
@@ -162,20 +208,38 @@ def _infer_token_length(text: str, tokens, context_length: int):
         return None
     return expanded_eot_index + 1
 
-def strict_validate(text: str):
+def strict_validate(
+    text: str,
+    tokenize_fn=tokenize,
+    context_length=None,
+    label="caption_short",
+    require_context_length: bool = False,
+):
     """严格校验文本长度，不允许截断；超长则抛错。"""
     try:
-        context_length = _get_context_length_default()
-        tokens = _tokenize_list(text, context_length)
+        if context_length is None:
+            context_length = _get_context_length_default(tokenize_fn, DEFAULT_CONTEXT_LENGTH)
+        tokens = _tokenize_list(
+            tokenize_fn,
+            text,
+            context_length,
+            require_context_length=require_context_length,
+        )
     except RuntimeError as e:
-        raise ValueError("caption_short too long after tokenization") from e
+        raise ValueError(f"{label} too long after tokenization") from e
     except Exception as e:
-        raise RuntimeError(f"caption_short tokenization failed: {e}") from e
-    token_length = _infer_token_length(text, tokens, context_length)
+        raise RuntimeError(f"{label} tokenization failed: {e}") from e
+    token_length = _infer_token_length(
+        tokenize_fn,
+        text,
+        tokens,
+        context_length,
+        require_context_length=require_context_length,
+    )
     if token_length is None:
-        raise RuntimeError("caption_short token length unavailable; refusing to truncate")
+        raise RuntimeError(f"{label} token length unavailable; refusing to truncate")
     if token_length > context_length:
-        raise ValueError("caption_short too long after tokenization")
+        raise ValueError(f"{label} too long after tokenization")
 
 def parse_captions_natural(text: str) -> tuple[str, str]:
     if text is None:
@@ -337,6 +401,21 @@ def main():
                 continue
             except Exception as e:
                 log_skip(log_f, item["obj_id"], "caption_short validation error", str(e))
+                continue
+
+            try:
+                strict_validate(
+                    long_caption,
+                    tokenize_fn=longclip_module.tokenize,
+                    context_length=DEFAULT_LONGCLIP_CONTEXT_LENGTH,
+                    label="caption_long",
+                    require_context_length=True,
+                )
+            except ValueError as e:
+                log_skip(log_f, item["obj_id"], "caption_long too long (tokenized)", str(e))
+                continue
+            except Exception as e:
+                log_skip(log_f, item["obj_id"], "caption_long validation error", str(e))
                 continue
             
             try:
