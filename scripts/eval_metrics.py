@@ -10,6 +10,8 @@ Metrics:
 
 The script reads images directly from their source directories without copying them
 elsewhere. GT and Gen filenames are assumed to align for each channel.
+If lit renders are stored under per-HDRI subfolders (lit/<hdri_name>), the script
+computes lit metrics per HDRI and reports their mean under HDRI/Mean/*.
 """
 
 import argparse
@@ -220,6 +222,59 @@ def collect_lit_paths(
     return all_gt_paths, all_gen_paths
 
 
+def list_subdirs(path: str) -> Set[str]:
+    if not os.path.isdir(path):
+        return set()
+    return {name for name in os.listdir(path) if os.path.isdir(os.path.join(path, name))}
+
+
+def detect_lit_hdris(
+    base_gt_dir: str,
+    base_gen_dir: str,
+    lit_subdir: str,
+    obj_ids: List[str],
+) -> List[str]:
+    candidates: Optional[Set[str]] = None
+    union: Set[str] = set()
+    had_subdirs = False
+    objs_without_subdirs: List[str] = []
+
+    for obj_id in obj_ids:
+        gt_dir = os.path.join(base_gt_dir, obj_id, lit_subdir)
+        gen_dir = os.path.join(base_gen_dir, obj_id, lit_subdir)
+        gt_subdirs = list_subdirs(gt_dir)
+        gen_subdirs = list_subdirs(gen_dir)
+
+        if gt_subdirs or gen_subdirs:
+            had_subdirs = True
+            if not gt_subdirs or not gen_subdirs:
+                raise FileNotFoundError(
+                    f"Lit HDRI subdir mismatch for {obj_id}: gt={sorted(gt_subdirs)} gen={sorted(gen_subdirs)}"
+                )
+            obj_subdirs = gt_subdirs & gen_subdirs
+            if not obj_subdirs:
+                raise FileNotFoundError(f"No common lit HDRI subdirs for {obj_id}")
+            union |= obj_subdirs
+            candidates = obj_subdirs if candidates is None else candidates & obj_subdirs
+        else:
+            objs_without_subdirs.append(obj_id)
+
+    if not had_subdirs:
+        return []
+    if objs_without_subdirs:
+        preview = ", ".join(objs_without_subdirs[:5])
+        raise FileNotFoundError(
+            f"Some objects lack lit HDRI subdirs under '{lit_subdir}' (e.g., {preview})"
+        )
+    if not candidates:
+        raise FileNotFoundError("No common lit HDRI subdirs across objects.")
+    if union != candidates:
+        missing = sorted(union - candidates)
+        if missing:
+            print(f"[WARN] HDRI subdirs not shared by all objects; ignoring: {', '.join(missing)}")
+    return sorted(candidates)
+
+
 def collect_unlit_channel_paths(
     base_gt_dir: str,
     base_gen_dir: str,
@@ -255,6 +310,197 @@ def collect_unlit_channel_paths(
         all_gen_paths.extend(gen_paths)
 
     return all_gt_paths, all_gen_paths
+
+
+def compute_lit_metrics_for_paths(
+    lit_gt_paths: List[str],
+    lit_gen_paths: List[str],
+    base_gen_dir: str,
+    batch_size: int,
+    device: torch.device,
+    metric_flags: Dict[str, bool],
+    clip_model: Optional[torch.nn.Module],
+    clip_preprocess: Optional[object],
+    longclip_model: Optional[torch.nn.Module],
+    longclip_preprocess: Optional[object],
+    longclip_module: Optional[object],
+    clip_text_feature_map: Optional[Dict[str, torch.Tensor]],
+    longclip_text_feature_map: Optional[Dict[str, torch.Tensor]],
+    do_clip_image: bool,
+    do_clip_text: bool,
+    do_longclip_text: bool,
+    kid_subset_size_default: int,
+) -> Dict[str, float]:
+    lit_metrics: Dict[str, float] = {}
+
+    kid_subset_size = None
+    if metric_flags["kid"]:
+        kid_subset_size = min(kid_subset_size_default, len(lit_gt_paths))
+        if kid_subset_size < kid_subset_size_default:
+            print(f"KID subset_size clipped to {kid_subset_size} due to limited samples.")
+
+    fid_metric = None
+    kid_metric = None
+    if metric_flags["fid"] or metric_flags["kid"]:
+        torchmetrics_mod = _lazy_import_torchmetrics()
+        if metric_flags["fid"]:
+            fid_metric = torchmetrics_mod.image.fid.FrechetInceptionDistance(feature=2048, normalize=False).to(device)
+        if metric_flags["kid"]:
+            kid_metric = torchmetrics_mod.image.kid.KernelInceptionDistance(subset_size=kid_subset_size, normalize=False).to(device)
+        _clear_cuda_cache()
+
+    clip_image_scores: List[float] = []
+    clip_text_scores: List[float] = []
+    longclip_text_scores: List[float] = []
+    total_batches = (len(lit_gen_paths) + batch_size - 1) // batch_size
+    print(f"Processing {total_batches} batches for lit metrics...")
+
+    with torch.no_grad():
+        for batch_idx, start in enumerate(range(0, len(lit_gen_paths), batch_size)):
+            batch_gen_paths = lit_gen_paths[start : start + batch_size]
+            batch_gt_paths = lit_gt_paths[start : start + batch_size]
+
+            try:
+                _, gen_uint8, gen_clip = load_batch(
+                    batch_gen_paths,
+                    clip_preprocess,
+                    device,
+                    include_clip=do_clip_image or do_clip_text,
+                )
+                _, gt_uint8, gt_clip = load_batch(
+                    batch_gt_paths,
+                    clip_preprocess,
+                    device,
+                    include_clip=do_clip_image,
+                )
+
+                gen_feat = None
+                if (do_clip_image or do_clip_text) and clip_model and gen_clip is not None:
+                    gen_feat = clip_model.encode_image(gen_clip)
+                    gen_feat = F.normalize(gen_feat, dim=-1)
+
+                if do_clip_image and clip_model and gen_feat is not None and gt_clip is not None:
+                    gt_feat = clip_model.encode_image(gt_clip)
+                    gt_feat = F.normalize(gt_feat, dim=-1)
+                    sim = (gen_feat * gt_feat).sum(dim=-1)
+                    clip_image_scores.append(sim.mean().item())
+                    del gt_feat
+
+                batch_obj_ids = None
+                if do_clip_text or do_longclip_text:
+                    batch_obj_ids = [obj_id_from_path(path, base_gen_dir) for path in batch_gen_paths]
+
+                if do_clip_text and gen_feat is not None and clip_text_feature_map is not None:
+                    text_feat = torch.stack([clip_text_feature_map[obj_id] for obj_id in batch_obj_ids], dim=0)
+                    sim = (gen_feat * text_feat).sum(dim=-1)
+                    clip_text_scores.append(sim.mean().item())
+                    del text_feat
+
+                if gen_clip is not None:
+                    del gen_clip
+                if gt_clip is not None:
+                    del gt_clip
+                if gen_feat is not None:
+                    del gen_feat
+                gen_clip = gt_clip = gen_feat = None
+                if batch_idx % 5 == 0:
+                    _clear_cuda_cache()
+
+                longclip_gen_feat = None
+                if do_longclip_text and longclip_model and longclip_preprocess is not None:
+                    _, _, gen_longclip = load_batch(
+                        batch_gen_paths,
+                        longclip_preprocess,
+                        device,
+                        include_clip=True,
+                    )
+                    if gen_longclip is not None:
+                        longclip_gen_feat = longclip_model.encode_image(gen_longclip)
+                        longclip_gen_feat = F.normalize(longclip_gen_feat, dim=-1)
+                        del gen_longclip
+
+                if do_longclip_text and longclip_gen_feat is not None and longclip_text_feature_map is not None:
+                    if batch_obj_ids is None:
+                        batch_obj_ids = [obj_id_from_path(path, base_gen_dir) for path in batch_gen_paths]
+                    long_text_feat = torch.stack(
+                        [longclip_text_feature_map[obj_id] for obj_id in batch_obj_ids],
+                        dim=0,
+                    )
+                    sim = (longclip_gen_feat * long_text_feat).sum(dim=-1)
+                    longclip_text_scores.append(sim.mean().item())
+                    del long_text_feat
+
+                if longclip_gen_feat is not None:
+                    del longclip_gen_feat
+                longclip_gen_feat = None
+
+                if fid_metric:
+                    fid_metric.update(gt_uint8, real=True)
+                    fid_metric.update(gen_uint8, real=False)
+                if kid_metric:
+                    kid_metric.update(gt_uint8, real=True)
+                    kid_metric.update(gen_uint8, real=False)
+
+                del gen_uint8, gt_uint8
+
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "out of memory" in error_msg or "cuda" in error_msg or "memory" in error_msg:
+                    print(f"[WARN] CUDA/Memory error at batch {batch_idx}/{total_batches}: {e}")
+                    print("[WARN] Clearing cache and skipping this batch...")
+                    _clear_cuda_cache()
+                    continue
+                print(f"[ERROR] Error at batch {batch_idx}: {e}")
+                traceback.print_exc()
+                raise
+
+            if (batch_idx + 1) % 10 == 0:
+                print(f"  Processed {batch_idx + 1}/{total_batches} batches")
+                _clear_cuda_cache()
+
+    if do_clip_image:
+        lit_metrics["CLIP_Image_Score"] = (
+            float(np.mean(clip_image_scores)) if clip_image_scores else float("nan")
+        )
+    if do_clip_text:
+        lit_metrics["CLIP_Text_Score"] = (
+            float(np.mean(clip_text_scores)) if clip_text_scores else float("nan")
+        )
+    if do_longclip_text:
+        lit_metrics["LongCLIP_Text_Score"] = (
+            float(np.mean(longclip_text_scores)) if longclip_text_scores else float("nan")
+        )
+    if fid_metric:
+        lit_metrics["FID"] = fid_metric.compute().item()
+        del fid_metric
+    if kid_metric:
+        try:
+            lit_metrics["KID"] = kid_metric.compute()[0].item()
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"Warning: KID computation failed ({exc}); skipping KID.")
+            lit_metrics["KID"] = float("nan")
+        del kid_metric
+    _clear_cuda_cache()
+
+    return lit_metrics
+
+
+def compute_mean_metrics(metrics_by_group: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    keys: Set[str] = set()
+    for metrics in metrics_by_group.values():
+        keys.update(metrics.keys())
+
+    mean_metrics: Dict[str, float] = {}
+    for key in sorted(keys):
+        values = [
+            val
+            for metrics in metrics_by_group.values()
+            if key in metrics
+            for val in [metrics[key]]
+            if isinstance(val, (int, float)) and math.isfinite(val)
+        ]
+        mean_metrics[key] = float(np.mean(values)) if values else float("nan")
+    return mean_metrics
 
 
 def parse_metrics_arg(metrics_arg: str) -> Dict[str, bool]:
@@ -752,44 +998,20 @@ def main() -> None:
     do_unlit_metrics = metric_flags["psnr"] or metric_flags["ssim"] or metric_flags["lpips"]
 
     if do_lit_metrics:
-        lit_gt_paths, lit_gen_paths = collect_lit_paths(
-            base_gt_dir,
-            base_gen_dir,
-            args.lit_subdir,
-            obj_ids,
-        )
-        if not lit_gt_paths:
-            raise RuntimeError("No lit image pairs found.")
-
-        print(f"Lit pairs: {len(lit_gt_paths)} images across {len(obj_ids)} objects.")
-
-        kid_subset_size = min(args.kid_subset_size, len(lit_gt_paths)) if metric_flags["kid"] else None
-        if kid_subset_size is not None and kid_subset_size < args.kid_subset_size:
-            print(f"KID subset_size clipped to {kid_subset_size} due to limited samples.")
-
-        # Lazy import torchmetrics for FID/KID
-        fid_metric = None
-        kid_metric = None
-        if metric_flags["fid"] or metric_flags["kid"]:
-            torchmetrics_mod = _lazy_import_torchmetrics()
-            if metric_flags["fid"]:
-                fid_metric = torchmetrics_mod.image.fid.FrechetInceptionDistance(feature=2048, normalize=False).to(device)
-            if metric_flags["kid"]:
-                kid_metric = torchmetrics_mod.image.kid.KernelInceptionDistance(subset_size=kid_subset_size, normalize=False).to(device)
-            _clear_cuda_cache()
+        lit_hdris = detect_lit_hdris(base_gt_dir, base_gen_dir, args.lit_subdir, obj_ids)
+        if lit_hdris:
+            print(f"Detected {len(lit_hdris)} HDRI subdirs under '{args.lit_subdir}': {', '.join(lit_hdris)}")
 
         clip_model = None
         clip_preprocess = None
         if do_clip_image or do_clip_text:
             print("Loading CLIP model...")
             try:
-                _clear_cuda_cache()  # Clear before loading
+                _clear_cuda_cache()
                 clip_module = _lazy_import_clip()
-                # Load to CPU first, then move to device to avoid fragmentation
                 clip_model, clip_preprocess = clip_module.load(args.clip_model, device="cpu")
                 clip_model = clip_model.to(device)
                 clip_model.eval()
-                # Disable gradient computation for inference
                 for param in clip_model.parameters():
                     param.requires_grad = False
                 print(f"CLIP model loaded: {args.clip_model}")
@@ -805,13 +1027,12 @@ def main() -> None:
         if do_longclip_text:
             print("Loading LongCLIP model...")
             try:
-                _clear_cuda_cache()  # Clear before loading
+                _clear_cuda_cache()
                 longclip_model, longclip_preprocess, longclip_module, import_source = load_longclip_model(
                     args.longclip_model,
                     device,
                     args.longclip_root,
                 )
-                # Disable gradient computation for inference
                 for param in longclip_model.parameters():
                     param.requires_grad = False
                 print(f"LongCLIP model loaded from: {import_source}")
@@ -865,122 +1086,54 @@ def main() -> None:
                     obj_id: long_text_features[i] for i, obj_id in enumerate(obj_ids)
                 }
 
-        clip_image_scores: List[float] = []
-        clip_text_scores: List[float] = []
-        longclip_text_scores: List[float] = []
-        total_batches = (len(lit_gen_paths) + batch_size - 1) // batch_size
-        print(f"Processing {total_batches} batches for lit metrics...")
-        
-        with torch.no_grad():
-            for batch_idx, start in enumerate(range(0, len(lit_gen_paths), batch_size)):
-                batch_gen_paths = lit_gen_paths[start : start + batch_size]
-                batch_gt_paths = lit_gt_paths[start : start + batch_size]
+        def run_lit_for_subdir(label: str, lit_subdir: str) -> Dict[str, float]:
+            lit_gt_paths, lit_gen_paths = collect_lit_paths(
+                base_gt_dir,
+                base_gen_dir,
+                lit_subdir,
+                obj_ids,
+            )
+            if not lit_gt_paths:
+                raise RuntimeError(f"No lit image pairs found for {label}.")
+            print(f"Lit pairs ({label}): {len(lit_gt_paths)} images across {len(obj_ids)} objects.")
+            return compute_lit_metrics_for_paths(
+                lit_gt_paths,
+                lit_gen_paths,
+                base_gen_dir,
+                batch_size,
+                device,
+                metric_flags,
+                clip_model,
+                clip_preprocess,
+                longclip_model,
+                longclip_preprocess,
+                longclip_module,
+                clip_text_feature_map,
+                longclip_text_feature_map,
+                do_clip_image,
+                do_clip_text,
+                do_longclip_text,
+                args.kid_subset_size,
+            )
 
-                try:
-                    _, gen_uint8, gen_clip = load_batch(
-                        batch_gen_paths,
-                        clip_preprocess,
-                        device,
-                        include_clip=do_clip_image or do_clip_text,
-                    )
-                    _, gt_uint8, gt_clip = load_batch(
-                        batch_gt_paths,
-                        clip_preprocess,
-                        device,
-                        include_clip=do_clip_image,
-                    )
+        lit_metrics_by_hdri: Dict[str, Dict[str, float]] = {}
+        if lit_hdris:
+            for hdri in lit_hdris:
+                lit_subdir = os.path.join(args.lit_subdir, hdri)
+                print(f"== HDRI: {hdri} ==")
+                lit_metrics = run_lit_for_subdir(hdri, lit_subdir)
+                lit_metrics_by_hdri[hdri] = lit_metrics
+                for metric_name, value in lit_metrics.items():
+                    final_metrics[f"HDRI/{hdri}/{metric_name}"] = value
 
-                    gen_feat = None
-                    if (do_clip_image or do_clip_text) and clip_model and gen_clip is not None:
-                        gen_feat = clip_model.encode_image(gen_clip)
-                        gen_feat = F.normalize(gen_feat, dim=-1)
+            mean_metrics = compute_mean_metrics(lit_metrics_by_hdri)
+            for metric_name, value in mean_metrics.items():
+                final_metrics[f"HDRI/Mean/{metric_name}"] = value
+        else:
+            lit_metrics = run_lit_for_subdir(args.lit_subdir, args.lit_subdir)
+            for metric_name, value in lit_metrics.items():
+                final_metrics[f"HDRI/Mean/{metric_name}"] = value
 
-                    if do_clip_image and clip_model and gen_feat is not None and gt_clip is not None:
-                        gt_feat = clip_model.encode_image(gt_clip)
-                        gt_feat = F.normalize(gt_feat, dim=-1)
-                        sim = (gen_feat * gt_feat).sum(dim=-1)
-                        clip_image_scores.append(sim.mean().item())
-                        del gt_feat
-
-                    batch_obj_ids = None
-                    if do_clip_text or do_longclip_text:
-                        batch_obj_ids = [obj_id_from_path(path, base_gen_dir) for path in batch_gen_paths]
-
-                    if do_clip_text and gen_feat is not None and clip_text_feature_map is not None:
-                        text_feat = torch.stack([clip_text_feature_map[obj_id] for obj_id in batch_obj_ids], dim=0)
-                        sim = (gen_feat * text_feat).sum(dim=-1)
-                        clip_text_scores.append(sim.mean().item())
-                        del text_feat
-
-                    # Clean up CLIP tensors before LongCLIP (safe deletion)
-                    if gen_clip is not None:
-                        del gen_clip
-                    if gt_clip is not None:
-                        del gt_clip
-                    if gen_feat is not None:
-                        del gen_feat
-                    gen_clip = gt_clip = gen_feat = None  # Reset to None
-                    if batch_idx % 5 == 0:
-                        _clear_cuda_cache()
-
-                    longclip_gen_feat = None
-                    if do_longclip_text and longclip_model and longclip_preprocess is not None:
-                        _, _, gen_longclip = load_batch(
-                            batch_gen_paths,
-                            longclip_preprocess,
-                            device,
-                            include_clip=True,
-                        )
-                        if gen_longclip is not None:
-                            longclip_gen_feat = longclip_model.encode_image(gen_longclip)
-                            longclip_gen_feat = F.normalize(longclip_gen_feat, dim=-1)
-                            del gen_longclip
-
-                    if do_longclip_text and longclip_gen_feat is not None and longclip_text_feature_map is not None:
-                        if batch_obj_ids is None:
-                            batch_obj_ids = [obj_id_from_path(path, base_gen_dir) for path in batch_gen_paths]
-                        long_text_feat = torch.stack(
-                            [longclip_text_feature_map[obj_id] for obj_id in batch_obj_ids],
-                            dim=0,
-                        )
-                        sim = (longclip_gen_feat * long_text_feat).sum(dim=-1)
-                        longclip_text_scores.append(sim.mean().item())
-                        del long_text_feat
-                    
-                    # Safe cleanup of longclip_gen_feat
-                    if longclip_gen_feat is not None:
-                        del longclip_gen_feat
-                    longclip_gen_feat = None
-
-                    if fid_metric:
-                        fid_metric.update(gt_uint8, real=True)
-                        fid_metric.update(gen_uint8, real=False)
-                    if kid_metric:
-                        kid_metric.update(gt_uint8, real=True)
-                        kid_metric.update(gen_uint8, real=False)
-
-                    # Safe cleanup of batch tensors
-                    del gen_uint8, gt_uint8
-
-                except Exception as e:
-                    error_msg = str(e).lower()
-                    if "out of memory" in error_msg or "cuda" in error_msg or "memory" in error_msg:
-                        print(f"[WARN] CUDA/Memory error at batch {batch_idx}/{total_batches}: {e}")
-                        print("[WARN] Clearing cache and skipping this batch...")
-                        _clear_cuda_cache()
-                        # Skip this batch on OOM - better than crashing
-                        continue
-                    else:
-                        print(f"[ERROR] Error at batch {batch_idx}: {e}")
-                        traceback.print_exc()
-                        raise
-
-                # Progress and periodic cleanup
-                if (batch_idx + 1) % 10 == 0:
-                    print(f"  Processed {batch_idx + 1}/{total_batches} batches")
-                    _clear_cuda_cache()
-
-        # Clean up models after lit metrics are done (safe deletion)
         print("Cleaning up CLIP/LongCLIP models...")
         if clip_model is not None:
             del clip_model
@@ -998,30 +1151,6 @@ def main() -> None:
             del longclip_text_feature_map
         clip_model = clip_preprocess = longclip_model = longclip_preprocess = None
         longclip_module = clip_text_feature_map = longclip_text_feature_map = None
-        _clear_cuda_cache()
-
-        if do_clip_image:
-            final_metrics["CLIP_Image_Score"] = (
-                float(np.mean(clip_image_scores)) if clip_image_scores else float("nan")
-            )
-        if do_clip_text:
-            final_metrics["CLIP_Text_Score"] = (
-                float(np.mean(clip_text_scores)) if clip_text_scores else float("nan")
-            )
-        if do_longclip_text:
-            final_metrics["LongCLIP_Text_Score"] = (
-                float(np.mean(longclip_text_scores)) if longclip_text_scores else float("nan")
-            )
-        if fid_metric:
-            final_metrics["FID"] = fid_metric.compute().item()
-            del fid_metric
-        if kid_metric:
-            try:
-                final_metrics["KID"] = kid_metric.compute()[0].item()
-            except Exception as exc:  # pragma: no cover - defensive
-                print(f"Warning: KID computation failed ({exc}); skipping KID.")
-                final_metrics["KID"] = float("nan")
-            del kid_metric
         _clear_cuda_cache()
 
     if do_unlit_metrics:

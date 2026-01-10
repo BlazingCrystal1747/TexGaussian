@@ -8,13 +8,18 @@ set -uo pipefail
 CONDA_BASE="$(conda info --base)"
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 ENV_NAME="${ENV_NAME:-metric}"
+set +u
 conda activate "$ENV_NAME"
+set -u
 
 # 默认参数，可通过环境变量或位置参数覆盖
 # 位置参数: $1=EXPERIMENT_NAME, $2=METRICS(可选，优先级最高)
 EXPERIMENT_NAME="${1:-exp003_test_batch_short}"
 BASE_GT_DIR="${BASE_GT_DIR:-"../datasets/texverse_rendered/test"}"
 BASE_GEN_DIR="${BASE_GEN_DIR:-"../experiments/${EXPERIMENT_NAME}/texverse_gen_renders"}"
+# If LIT_SUBDIR contains HDRI subfolders, eval_metrics.py will compute per-HDRI stats + mean.
+# Lit metrics are recorded under HDRI/Mean/* (no top-level lit keys).
+# To evaluate a single HDRI, set LIT_SUBDIR="lit/<hdri_name>".
 LIT_SUBDIR="${LIT_SUBDIR:-"lit"}"
 UNLIT_SUBDIR="${UNLIT_SUBDIR:-"unlit"}"
 # 降低默认批量大小以避免 OOM (从 8 改为 4)
