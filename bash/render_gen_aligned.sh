@@ -26,15 +26,24 @@ TRANSFORMS_SUBDIR=""   # 可选：如果 transforms 在子目录内，设置该�
 # 输出目录
 OUT_ROOT="../experiments/exp003_test_batch_short/texverse_gen_renders"
 
-# HDRI（lit 渲染必需）
-HDRI_PATH="../datasets/hdri/rogland_sunset_4k.exr"
+# HDRI（lit 渲染必需，可配置多个）
+HDRI_PATHS=(
+  "../datasets/hdri/studio_small_09_2k.exr",
+  "../datasets/hdri/shanghai_bund_2k.exr",
+  "../datasets/hdri/sunflowers_puresky_2k.exr"
+)
+
+HDRI_ARGS=()
+for hdri in "${HDRI_PATHS[@]}"; do
+  HDRI_ARGS+=(--hdri "$hdri")
+done
 
 echo "=============================================="
 echo "Render Generated Assets with GT Cameras"
 echo "Manifest:   $MANIFEST_PATH"
 echo "GT Root:    $GT_ROOT"
 echo "Output:     $OUT_ROOT/{obj_id}/(lit|unlit)"
-echo "HDRI:       $HDRI_PATH"
+echo "HDRIs:      ${HDRI_PATHS[*]}"
 echo "=============================================="
 
 # 3. 执行渲染
@@ -43,7 +52,7 @@ CUDA_VISIBLE_DEVICES=0 python ./scripts/render_gen_aligned.py \
   --gt-root "$GT_ROOT" \
   --transforms-subdir "$TRANSFORMS_SUBDIR" \
   --out-root "$OUT_ROOT" \
-  --hdri "$HDRI_PATH" \
+  "${HDRI_ARGS[@]}" \
   --samples 64 \
   --hdri-strength 1.0 \
   --save-blend \

@@ -21,21 +21,28 @@ MANIFEST_PATH="../experiments/common_splits/test.tsv"
 # 输出: 数据集根目录 (脚本会自动创建 {obj_id}/lit 与 {obj_id}/unlit)
 OUT_ROOT="../datasets/texverse_rendered"
 
-# 资源: HDRI 环境贴图 (lit 渲染必需)
-HDRI_PATH="../datasets/hdri/rogland_sunset_4k.exr"
+# 资源: HDRI 环境贴图 (lit 渲染必需，可配置多个)
+HDRI_PATHS=(
+  "../datasets/hdri/rogland_sunset_4k.exr"
+)
+
+HDRI_ARGS=()
+for hdri in "${HDRI_PATHS[@]}"; do
+  HDRI_ARGS+=(--hdri "$hdri")
+done
 
 echo "=========================================="
 echo "Start Rendering GT (Lit+Unlit)"
 echo "Manifest: $MANIFEST_PATH"
 echo "Output:   $OUT_ROOT/{obj_id}/(lit|unlit)"
-echo "HDRI:     $HDRI_PATH"
+echo "HDRIs:    ${HDRI_PATHS[*]}"
 echo "=========================================="
 
 # 3. 执行 Python 渲染命令
 CUDA_VISIBLE_DEVICES=0 python ./scripts/render_gt_dataset.py \
   --manifest "$MANIFEST_PATH" \
   --out-root "$OUT_ROOT" \
-  --hdri "$HDRI_PATH" \
+  "${HDRI_ARGS[@]}" \
   --resolution 512 \
   --views 64 \
   --seed 42 \

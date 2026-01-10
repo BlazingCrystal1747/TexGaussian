@@ -13,6 +13,7 @@ import contextlib
 import csv
 import json
 import os
+import re
 import sys
 from typing import Any, Dict, List, Tuple
 
@@ -51,6 +52,48 @@ def resolve_path(path: str, base_dir: str) -> str:
     if os.path.isabs(path):
         return path
     return os.path.abspath(os.path.join(base_dir, path))
+
+
+def normalize_hdri_args(hdri_arg: Any) -> List[str]:
+    if not hdri_arg:
+        return []
+    if isinstance(hdri_arg, str):
+        raw = [hdri_arg]
+    else:
+        raw = list(hdri_arg)
+    paths: List[str] = []
+    for item in raw:
+        if not item:
+            continue
+        parts = [p.strip() for p in item.split(",") if p.strip()]
+        paths.extend(parts)
+    return paths
+
+
+def sanitize_hdri_name(path: str) -> str:
+    base = os.path.splitext(os.path.basename(path))[0]
+    base = re.sub(r"[^A-Za-z0-9_-]+", "_", base)
+    return base.strip("_") or "hdri"
+
+
+def build_hdri_entries(hdri_arg: Any) -> List[Dict[str, str]]:
+    paths = normalize_hdri_args(hdri_arg)
+    entries: List[Dict[str, str]] = []
+    seen_paths = set()
+    name_counts: Dict[str, int] = {}
+    for idx, path in enumerate(paths):
+        abs_path = os.path.abspath(path)
+        if abs_path in seen_paths:
+            continue
+        seen_paths.add(abs_path)
+        base = sanitize_hdri_name(abs_path)
+        if not base:
+            base = f"hdri_{idx}"
+        count = name_counts.get(base, 0)
+        name = base if count == 0 else f"{base}_{count + 1}"
+        name_counts[base] = count + 1
+        entries.append({"path": abs_path, "name": name})
+    return entries
 
 
 def find_normal_path(explicit_normal: str, fallback_from: str) -> str:
@@ -502,7 +545,6 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
     lens_mm = float(lens_mm) if lens_mm is not None else args.fallback_focal
 
     obj_root = os.path.join(args.out_root, oid)
-    lit_dir = os.path.join(obj_root, "lit")
     unlit_dir = os.path.join(obj_root, "unlit")
 
     frame_data: List[Tuple[int, Dict[str, Any], Matrix, str]] = []
@@ -525,9 +567,25 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
     unlit_names = {
         name: images.get(name) or f"{last_base}_{name}.png" for name, _ in PASS_CONFIG
     }
-    lit_done = os.path.exists(os.path.join(lit_dir, lit_name))
+    os.makedirs(unlit_dir, exist_ok=True)
+    lit_configs: List[Dict[str, str]] = []
+    lit_configs_to_render: List[Dict[str, str]] = []
+    for entry in args.hdris:
+        subdir = "lit" if not args.multi_hdri else os.path.join("lit", entry["name"])
+        lit_dir = os.path.join(obj_root, subdir)
+        os.makedirs(lit_dir, exist_ok=True)
+        cfg = {
+            "path": entry["path"],
+            "name": entry["name"],
+            "subdir": subdir,
+            "dir": lit_dir,
+        }
+        lit_configs.append(cfg)
+        if not os.path.exists(os.path.join(lit_dir, lit_name)):
+            lit_configs_to_render.append(cfg)
+
     unlit_done = all(os.path.exists(os.path.join(unlit_dir, fname)) for fname in unlit_names.values())
-    if lit_done and unlit_done:
+    if not lit_configs_to_render and unlit_done:
         log(f"{oid}: found existing renders, skip.")
         return True
 
@@ -574,9 +632,6 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
     cam = create_camera(scene, lens_mm)
     validate_intrinsics(cam, scene, intrinsics, oid)
 
-    os.makedirs(lit_dir, exist_ok=True)
-    os.makedirs(unlit_dir, exist_ok=True)
-
     def apply_camera(w2c: Matrix, idx: int) -> bool:
         try:
             cam.matrix_world = w2c.inverted()
@@ -591,39 +646,42 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
         return True
 
     # Lit pass
-    scene.cycles.samples = args.samples
-    try:
-        setup_background(scene, args.background, args.hdri, args.hdri_strength)
-    except Exception as e:
-        log(f"{oid}: background setup failed ({e}), skip.")
-        return False
-    mesh_obj.data.materials.clear()
-    mesh_obj.data.materials.append(mat_beauty)
-    for idx, frame, w2c, base in frame_data:
-        if not apply_camera(w2c, idx):
-            continue
-        out_name = frame.get("file_name") or f"{base}_beauty.png"
-        scene.render.filepath = os.path.join(lit_dir, out_name)
-        with suppress_render_output():
-            bpy.ops.render.render(write_still=True)
+    if lit_configs_to_render:
+        scene.cycles.samples = args.samples
+        mesh_obj.data.materials.clear()
+        mesh_obj.data.materials.append(mat_beauty)
+        for lit_cfg in lit_configs_to_render:
+            try:
+                setup_background(scene, args.background, lit_cfg["path"], args.hdri_strength)
+            except Exception as e:
+                log(f"{oid}: background setup failed for {lit_cfg['name']} ({e}), skip.")
+                continue
+            for idx, frame, w2c, base in frame_data:
+                if not apply_camera(w2c, idx):
+                    continue
+                out_name = frame.get("file_name") or f"{base}_beauty.png"
+                scene.render.filepath = os.path.join(lit_cfg["dir"], out_name)
+                with suppress_render_output():
+                    bpy.ops.render.render(write_still=True)
 
     # Unlit pass (emission)
-    scene.cycles.samples = 1
-    setup_background(scene, "transparent", "", 0.0)
-    for idx, frame, w2c, base in frame_data:
-        if not apply_camera(w2c, idx):
-            continue
-        images = frame.get("images") or {}
-        for pass_name, _ in PASS_CONFIG:
-            mat = emission_mats.get(pass_name)
-            if mat is None:
+    if not unlit_done:
+        scene.cycles.samples = 1
+        setup_background(scene, "transparent", "", 0.0)
+        for idx, frame, w2c, base in frame_data:
+            if not apply_camera(w2c, idx):
                 continue
-            mesh_obj.data.materials.clear()
-            mesh_obj.data.materials.append(mat)
-            out_name = images.get(pass_name) or f"{base}_{pass_name}.png"
-            scene.render.filepath = os.path.join(unlit_dir, out_name)
-            with suppress_render_output():
-                bpy.ops.render.render(write_still=True)
+            images = frame.get("images") or {}
+            for pass_name, _ in PASS_CONFIG:
+                mat = emission_mats.get(pass_name)
+                if mat is None:
+                    continue
+                mesh_obj.data.materials.clear()
+                mesh_obj.data.materials.append(mat)
+                out_name = images.get(pass_name) or f"{base}_{pass_name}.png"
+                scene.render.filepath = os.path.join(unlit_dir, out_name)
+                with suppress_render_output():
+                    bpy.ops.render.render(write_still=True)
 
     if args.save_blend:
         blend_path = os.path.join(obj_root, "scene.blend")
@@ -658,7 +716,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--out-root", required=True, help="Where rendered images will be saved (per obj_id subfolder).")
-    parser.add_argument("--hdri", default="", help="HDRI path (required for lit renders).")
+    parser.add_argument(
+        "--hdri",
+        action="append",
+        default=[],
+        help="HDRI path(s) for lit renders. Repeat or pass a comma-separated list.",
+    )
     parser.add_argument("--hdri-strength", type=float, default=1.0, help="HDRI intensity for lit renders.")
     parser.add_argument("--samples", type=int, default=64, help="Cycles samples for lit renders (unlit uses 1).")
     parser.add_argument("--background", choices=["black", "white", "hdri", "transparent"], default=None, help="Background mode for lit renders.")
@@ -680,9 +743,16 @@ def main(argv: List[str]) -> None:
     if not os.path.exists(manifest_path):
         log(f"Manifest not found: {manifest_path}")
         return
-    if not args.hdri or not os.path.exists(args.hdri):
-        log("Lit renders require a valid --hdri path.")
+
+    args.hdris = build_hdri_entries(args.hdri)
+    if not args.hdris:
+        log("Lit renders require at least one valid --hdri path.")
         return
+    missing_hdris = [entry["path"] for entry in args.hdris if not os.path.exists(entry["path"])]
+    if missing_hdris:
+        log(f"Lit renders missing HDRI files: {', '.join(missing_hdris)}")
+        return
+    args.multi_hdri = len(args.hdris) > 1
 
     with open(manifest_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t")
