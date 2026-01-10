@@ -489,7 +489,13 @@ def save_experiment_config(exp_dir, opt, processed_samples, skipped_samples=None
         json.dump(cfg, f, indent=2)
 
 
-def build_result_row(obj_id: str, sample_dir: str, caption: str = None):
+def build_result_row(
+    obj_id: str,
+    sample_dir: str,
+    caption_short: str = None,
+    caption_long: str = None,
+    caption_used: str = None,
+):
     """Collect generated asset paths for a single sample into a TSV-ready dict."""
     sample_dir = os.path.abspath(sample_dir)
 
@@ -505,8 +511,12 @@ def build_result_row(obj_id: str, sample_dir: str, caption: str = None):
         "metal": path_if_exists("metallic.png"),
         "normal": path_if_exists("normal.png"),
     }
-    if caption is not None:
-        row["caption"] = caption
+    if caption_short is not None:
+        row["caption_short"] = caption_short
+    if caption_long is not None:
+        row["caption_long"] = caption_long
+    if caption_used is not None:
+        row["caption_used"] = caption_used
     return row
 
 
@@ -517,8 +527,10 @@ def write_result_manifest(tsv_path: str, rows):
         return
 
     fieldnames = ["obj_id", "mesh", "albedo", "rough", "metal", "normal"]
-    if any("caption" in r for r in rows):
-        fieldnames.append("caption")
+    caption_fields = ["caption_short", "caption_long", "caption_used"]
+    for name in caption_fields:
+        if any(name in r for r in rows):
+            fieldnames.append(name)
 
     tsv_dir = os.path.dirname(tsv_path) or "."
     os.makedirs(tsv_dir, exist_ok=True)
@@ -573,6 +585,8 @@ if __name__ == "__main__":
 
         for idx, row in enumerate(batch_rows):
             mesh_path = (row.get("mesh") or "").strip()
+            caption_short = (row.get("caption_short") or "").strip()
+            caption_long = (row.get("caption_long") or "").strip()
             caption = (row.get(opt.caption_field) or "").strip()
             obj_id = (row.get("obj_id") or "").strip() or f"sample_{idx}"
 
@@ -599,7 +613,9 @@ if __name__ == "__main__":
             processed_samples.append(build_result_row(
                 converter.opt.texture_name,
                 sample_output_dir,
-                caption if caption else None,
+                caption_short=caption_short,
+                caption_long=caption_long,
+                caption_used=opt.caption_field,
             ))
 
         if processed_samples:
@@ -613,7 +629,7 @@ if __name__ == "__main__":
         sample_output_dir = os.path.join(textures_dir, opt.texture_name)
         converter.export_mesh(sample_output_dir)
 
-        processed_samples = [build_result_row(opt.texture_name, sample_output_dir, opt.text_prompt if opt.text_prompt else None)]
+        processed_samples = [build_result_row(opt.texture_name, sample_output_dir)]
         write_result_manifest(result_tsv_path, processed_samples)
         save_experiment_config(output_dir, opt, processed_samples, manifest_path=result_tsv_path)
 
