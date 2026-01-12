@@ -32,6 +32,7 @@ PASS_CONFIG_UNLIT = [
     ("rough", "Non-Color"),
     ("metal", "Non-Color"),
     ("normal", "Non-Color"),  # 法线贴图仅当作颜色
+    ("depth", "Non-Color"),   # 深度图用于多视角一致性评估
 ]
 
 DEFAULT_VIEWS = 64
@@ -368,6 +369,78 @@ def build_geometry_normal_material(name: str) -> bpy.types.Material:
     return mat
 
 
+def build_depth_material(name: str, near: float = 0.1, far: float = 10.0) -> bpy.types.Material:
+    """Builds a material that outputs normalized camera-space depth.
+    
+    The depth is normalized to [0, 1] range where:
+    - 0 = near plane (closest)
+    - 1 = far plane (farthest)
+    
+    This is essential for multi-view consistency evaluation via reprojection.
+    
+    Args:
+        name: Material name
+        near: Near plane distance
+        far: Far plane distance
+    
+    Returns:
+        Blender material outputting normalized depth as grayscale emission
+    """
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    for n in list(nodes):
+        nodes.remove(n)
+
+    # Camera Data node gives us view depth (distance from camera in camera-space Z)
+    cam_data = nodes.new("ShaderNodeCameraData")
+    cam_data.location = (-600, 0)
+    
+    # Math node to normalize: (depth - near) / (far - near)
+    # Step 1: Subtract near
+    sub_near = nodes.new("ShaderNodeMath")
+    sub_near.operation = "SUBTRACT"
+    sub_near.inputs[1].default_value = near
+    sub_near.location = (-400, 0)
+    
+    # Step 2: Divide by (far - near)
+    div_range = nodes.new("ShaderNodeMath")
+    div_range.operation = "DIVIDE"
+    div_range.inputs[1].default_value = far - near
+    div_range.location = (-200, 0)
+    
+    # Clamp to [0, 1]
+    clamp = nodes.new("ShaderNodeClamp")
+    clamp.inputs["Min"].default_value = 0.0
+    clamp.inputs["Max"].default_value = 1.0
+    clamp.location = (0, 0)
+    
+    # Convert to RGB (grayscale)
+    combine = nodes.new("ShaderNodeCombineXYZ")
+    combine.location = (200, 0)
+    
+    # Emission output
+    emis = nodes.new("ShaderNodeEmission")
+    emis.inputs["Strength"].default_value = 1.0
+    emis.location = (400, 0)
+    
+    out = nodes.new("ShaderNodeOutputMaterial")
+    out.location = (600, 0)
+    
+    # Connect: CameraData.ViewZ -> Sub -> Div -> Clamp -> Combine -> Emission -> Output
+    links.new(cam_data.outputs["View Z Depth"], sub_near.inputs[0])
+    links.new(sub_near.outputs["Value"], div_range.inputs[0])
+    links.new(div_range.outputs["Value"], clamp.inputs["Value"])
+    links.new(clamp.outputs["Result"], combine.inputs["X"])
+    links.new(clamp.outputs["Result"], combine.inputs["Y"])
+    links.new(clamp.outputs["Result"], combine.inputs["Z"])
+    links.new(combine.outputs["Vector"], emis.inputs["Color"])
+    links.new(emis.outputs["Emission"], out.inputs["Surface"])
+    
+    return mat
+
+
 def build_pbr_material(albedo: str, rough: str, metal: str, normal: str) -> bpy.types.Material:
     mat = bpy.data.materials.new(name="PBR_MATERIAL")
     mat.use_nodes = True
@@ -563,6 +636,9 @@ def render_object(row: Dict[str, str], args: argparse.Namespace, rng: random.Ran
         return False
 
     pbr_mat = build_pbr_material(albedo, rough, metal, normal)
+    # Depth material: use camera radius as far plane for normalization
+    depth_near = 0.1
+    depth_far = args.radius * 2.0  # Object is at origin, camera at radius
     unlit_mats = {
         "albedo": build_emission_material("ALBEDO_EMIT", albedo, "sRGB"),
         "rough": build_emission_material("ROUGH_EMIT", rough, "Non-Color"),
@@ -570,6 +646,7 @@ def render_object(row: Dict[str, str], args: argparse.Namespace, rng: random.Ran
         "normal": build_world_normal_material("NORMAL_EMIT", normal)
         if normal
         else build_geometry_normal_material("NORMAL_GEO"),
+        "depth": build_depth_material("DEPTH_EMIT", near=depth_near, far=depth_far),
     }
 
     cam = create_camera(scene, args.focal_length)
@@ -597,6 +674,7 @@ def render_object(row: Dict[str, str], args: argparse.Namespace, rng: random.Ran
                     "rough": f"{frame_prefix}_rough.png",
                     "metal": f"{frame_prefix}_metal.png",
                     "normal": f"{frame_prefix}_normal.png",
+                    "depth": f"{frame_prefix}_depth.png",
                 },
                 "world_to_camera": [[float(v) for v in row_vec] for row_vec in w2c],
             }
@@ -659,6 +737,12 @@ def render_object(row: Dict[str, str], args: argparse.Namespace, rng: random.Ran
             "unlit": {
                 "samples": 1,
                 "background": "transparent",
+            },
+            "depth": {
+                "near": depth_near,
+                "far": depth_far,
+                "normalized": True,
+                "description": "Depth values are normalized to [0, 1] range where 0=near, 1=far",
             },
         },
     }

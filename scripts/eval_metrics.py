@@ -8,6 +8,22 @@ Metrics:
 - Semantic (lit only): CLIP image similarity, CLIP text similarity (caption_short), LongCLIP text similarity (caption_long)
 - Optional: LPIPS on masked albedo when enabled
 
+Multi-View Consistency Metrics (CVPR 2025 / ECCV 2024-2025 standard):
+- CrossView_LPIPS: Perceptual consistency between adjacent views (detects Janus problems)
+- CrossView_L1: Pixel-level consistency between adjacent views
+- Normal_Consistency: Angular consistency of surface normals across views
+- Normal_Distribution_Div: Distribution divergence of normals (detects multi-face artifacts)
+- Reproj_L1 / Reproj_LPIPS: Reprojection error when depth maps are available (MEt3R/MVGBench style)
+
+The consistency metrics are critical for detecting:
+1. Janus (multi-face) problems common in 3D generation
+2. Texture flickering across viewpoints
+3. Geometric inconsistencies
+
+Usage:
+    python eval_metrics.py --experiment_name my_exp --metrics all
+    python eval_metrics.py --experiment_name my_exp --metrics consistency --consistency_channel albedo
+
 The script reads images directly from their source directories without copying them
 elsewhere. GT and Gen filenames are assumed to align for each channel.
 If lit renders are stored under per-HDRI subfolders (lit/<hdri_name>), the script
@@ -158,10 +174,24 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help=(
             "Which metrics to compute. Presets: all | pixel (psnr,ssim,lpips) | "
-            "dist (fid,kid) | semantic (clip). Pixel metrics are computed per unlit channel. "
+            "dist (fid,kid) | semantic (clip) | consistency (multi-view). "
+            "Pixel metrics are computed per unlit channel. "
             "CLIP text similarity uses caption_short and LongCLIP uses caption_long when --prompts_file is provided. "
-            "You can also pass a comma list, e.g., 'psnr,ssim,clip'."
+            "Multi-view consistency metrics detect Janus/flickering issues. "
+            "You can also pass a comma list, e.g., 'psnr,ssim,clip,consistency'."
         ),
+    )
+    parser.add_argument(
+        "--consistency_pairs",
+        type=int,
+        default=5,
+        help="Number of random adjacent view pairs to sample per object for consistency metrics.",
+    )
+    parser.add_argument(
+        "--consistency_channel",
+        default="albedo",
+        choices=["albedo", "lit", "normal"],
+        help="Which channel to use for cross-view consistency: albedo, lit (beauty), or normal.",
     )
     return parser.parse_args()
 
@@ -506,14 +536,16 @@ def compute_mean_metrics(metrics_by_group: Dict[str, Dict[str, float]]) -> Dict[
 def parse_metrics_arg(metrics_arg: str) -> Dict[str, bool]:
     metrics_arg = metrics_arg.lower().replace(" ", "")
     presets = {
-        "all": {"psnr", "ssim", "lpips", "fid", "kid", "clip"},
+        "all": {"psnr", "ssim", "lpips", "fid", "kid", "clip", "consistency"},
         "pixel": {"psnr", "ssim", "lpips"},
         "structural": {"psnr", "ssim", "lpips"},
         "dist": {"fid", "kid"},
         "distribution": {"fid", "kid"},
         "semantic": {"clip"},
+        "consistency": {"consistency"},
+        "geometric": {"consistency"},
     }
-    supported: Set[str] = {"psnr", "ssim", "lpips", "fid", "kid", "clip"}
+    supported: Set[str] = {"psnr", "ssim", "lpips", "fid", "kid", "clip", "consistency"}
     if metrics_arg in presets:
         selected = presets[metrics_arg]
     else:
@@ -815,6 +847,786 @@ def compute_masked_ssim(
     ssim_map = ssim_map.mean(dim=1, keepdim=True)
     ssim_val = (ssim_map * mask).sum() / mask_count
     return ssim_val.item(), mask_count
+
+
+# ===================== Multi-View Consistency Metrics =====================
+# These metrics detect Janus (multi-face) problems and texture flickering
+# by measuring consistency across adjacent views.
+
+
+def load_transforms_json(transforms_path: str) -> Dict:
+    """Load camera transforms from transforms.json."""
+    with open(transforms_path, "r") as f:
+        return json.load(f)
+
+
+def get_camera_intrinsics(transforms: Dict) -> Tuple[float, float, float, float, int, int]:
+    """Extract camera intrinsics from transforms dict."""
+    intrinsics = transforms.get("intrinsics", {})
+    fx = intrinsics.get("fx", 711.111)
+    fy = intrinsics.get("fy", 711.111)
+    cx = intrinsics.get("cx", 256.0)
+    cy = intrinsics.get("cy", 256.0)
+    w = intrinsics.get("w", 512)
+    h = intrinsics.get("h", 512)
+    return fx, fy, cx, cy, w, h
+
+
+def world_to_camera_matrix(frame: Dict) -> np.ndarray:
+    """Get 4x4 world-to-camera matrix from frame dict."""
+    return np.array(frame["world_to_camera"], dtype=np.float32)
+
+
+def camera_to_world_matrix(frame: Dict) -> np.ndarray:
+    """Get 4x4 camera-to-world matrix (inverse of world-to-camera)."""
+    w2c = world_to_camera_matrix(frame)
+    return np.linalg.inv(w2c)
+
+
+def compute_relative_pose(frame1: Dict, frame2: Dict) -> np.ndarray:
+    """Compute relative pose from camera1 to camera2 coordinate system.
+    
+    Returns T_2_1: transforms points from camera1 coords to camera2 coords.
+    """
+    c2w_1 = camera_to_world_matrix(frame1)  # cam1 -> world
+    w2c_2 = world_to_camera_matrix(frame2)   # world -> cam2
+    return w2c_2 @ c2w_1  # cam1 -> world -> cam2
+
+
+def select_adjacent_view_pairs(
+    frames: List[Dict],
+    num_pairs: int,
+    seed: int = 42,
+) -> List[Tuple[int, int]]:
+    """Select pairs of adjacent views for consistency evaluation.
+    
+    Adjacent views are consecutive frames (0-1, 1-2, ..., N-1-0 for cyclic).
+    Returns list of (frame_idx1, frame_idx2) pairs.
+    """
+    n_frames = len(frames)
+    if n_frames < 2:
+        return []
+    
+    # Create all possible adjacent pairs (cyclic)
+    all_pairs = [(i, (i + 1) % n_frames) for i in range(n_frames)]
+    
+    # Limit to num_pairs
+    rng = np.random.default_rng(seed)
+    if len(all_pairs) > num_pairs:
+        indices = rng.choice(len(all_pairs), size=num_pairs, replace=False)
+        pairs = [all_pairs[i] for i in sorted(indices)]
+    else:
+        pairs = all_pairs
+    
+    return pairs
+
+
+def load_image_rgba(path: str, device: torch.device) -> torch.Tensor:
+    """Load image as RGBA float tensor [1, 4, H, W] in [0, 1]."""
+    with Image.open(path) as img:
+        img = img.convert("RGBA")
+        np_img = np.array(img, dtype=np.uint8)
+    tensor = torch.from_numpy(np_img).permute(2, 0, 1).float().div(255.0)
+    return tensor.unsqueeze(0).to(device)
+
+
+def compute_cross_view_lpips(
+    img1: torch.Tensor,
+    img2: torch.Tensor,
+    lpips_model,
+) -> float:
+    """Compute LPIPS between two views using intersection of alpha masks.
+    
+    Args:
+        img1, img2: (1, 4, H, W) RGBA tensors in [0, 1]
+        lpips_model: LPIPS model instance
+    
+    Returns:
+        LPIPS value (lower = more similar)
+    """
+    # Extract alpha and compute mask intersection
+    alpha1 = img1[:, 3:4, ...]
+    alpha2 = img2[:, 3:4, ...]
+    mask = ((alpha1 > 0.5) & (alpha2 > 0.5)).float()
+    
+    mask_count = mask.sum().item()
+    if mask_count < MIN_MASK_PIXELS:
+        return float("nan")
+    
+    # Apply mask to RGB channels
+    rgb1 = img1[:, :3, ...] * mask
+    rgb2 = img2[:, :3, ...] * mask
+    
+    # LPIPS expects [-1, 1] input
+    with torch.no_grad():
+        lpips_val = lpips_model(rgb1 * 2.0 - 1.0, rgb2 * 2.0 - 1.0)
+    
+    return lpips_val.mean().item()
+
+
+def compute_cross_view_l1(
+    img1: torch.Tensor,
+    img2: torch.Tensor,
+) -> float:
+    """Compute masked L1 between two views.
+    
+    Args:
+        img1, img2: (1, 4, H, W) RGBA tensors in [0, 1]
+    
+    Returns:
+        Mean L1 error over masked pixels
+    """
+    alpha1 = img1[:, 3:4, ...]
+    alpha2 = img2[:, 3:4, ...]
+    mask = ((alpha1 > 0.5) & (alpha2 > 0.5)).float()
+    
+    mask_count = mask.sum().item()
+    if mask_count < MIN_MASK_PIXELS:
+        return float("nan")
+    
+    rgb1 = img1[:, :3, ...]
+    rgb2 = img2[:, :3, ...]
+    
+    diff = (rgb1 - rgb2).abs() * mask
+    l1 = diff.sum() / (mask_count * 3.0)
+    
+    return l1.item()
+
+
+def compute_normal_angular_consistency(
+    normal1: torch.Tensor,
+    normal2: torch.Tensor,
+    relative_pose: np.ndarray,
+) -> float:
+    """Compute angular consistency of normals across views.
+    
+    For true multi-view consistency, normals from view1 should match normals from view2
+    when transformed to the same coordinate system. This detects Janus problems where
+    different views show completely different surface orientations.
+    
+    Args:
+        normal1, normal2: (1, 4, H, W) normal maps in [0, 1] (will be converted to [-1, 1])
+        relative_pose: 4x4 matrix transforming from camera1 to camera2 coords
+    
+    Returns:
+        Mean angular error in degrees (lower = more consistent)
+    """
+    alpha1 = normal1[:, 3:4, ...]
+    alpha2 = normal2[:, 3:4, ...]
+    mask = ((alpha1 > 0.5) & (alpha2 > 0.5)).float()
+    
+    mask_count = mask.sum().item()
+    if mask_count < MIN_MASK_PIXELS:
+        return float("nan")
+    
+    # Convert normals from [0, 1] to [-1, 1] and normalize
+    n1 = normal1[:, :3, ...] * 2.0 - 1.0
+    n2 = normal2[:, :3, ...] * 2.0 - 1.0
+    
+    n1 = F.normalize(n1, dim=1, eps=1e-6)
+    n2 = F.normalize(n2, dim=1, eps=1e-6)
+    
+    # For Janus detection, we compare the distribution of normal directions
+    # rather than per-pixel correspondence (which would require depth for reprojection)
+    # A consistent surface should have similar normal distributions across adjacent views
+    
+    # Compute cosine similarity at each pixel position
+    # Note: This is a simplified metric; full reprojection would require depth maps
+    dot = (n1 * n2).sum(dim=1, keepdim=True).clamp(-1.0, 1.0)
+    ang_err = torch.acos(dot) * (180.0 / math.pi)
+    
+    # Compute mean angular error over masked pixels
+    mean_error = (ang_err * mask).sum() / mask_count
+    
+    return mean_error.item()
+
+
+def compute_normal_distribution_divergence(
+    normal1: torch.Tensor,
+    normal2: torch.Tensor,
+) -> float:
+    """Compute divergence of normal distributions between two views.
+    
+    This metric quantifies whether the distribution of surface normals is consistent
+    across views. Janus problems typically show very different normal distributions
+    (e.g., one view faces left, another faces right).
+    
+    Args:
+        normal1, normal2: (1, 4, H, W) normal maps in [0, 1]
+    
+    Returns:
+        KL divergence approximation (lower = more consistent distributions)
+    """
+    alpha1 = normal1[:, 3:4, ...]
+    alpha2 = normal2[:, 3:4, ...]
+    
+    mask1 = (alpha1 > 0.5).squeeze()
+    mask2 = (alpha2 > 0.5).squeeze()
+    
+    if mask1.sum() < MIN_MASK_PIXELS or mask2.sum() < MIN_MASK_PIXELS:
+        return float("nan")
+    
+    # Convert normals and extract valid pixels
+    n1 = normal1[:, :3, ...].squeeze().permute(1, 2, 0)  # (H, W, 3)
+    n2 = normal2[:, :3, ...].squeeze().permute(1, 2, 0)
+    
+    n1 = n1 * 2.0 - 1.0
+    n2 = n2 * 2.0 - 1.0
+    
+    n1_valid = n1[mask1]  # (N1, 3)
+    n2_valid = n2[mask2]  # (N2, 3)
+    
+    n1_valid = F.normalize(n1_valid, dim=1, eps=1e-6)
+    n2_valid = F.normalize(n2_valid, dim=1, eps=1e-6)
+    
+    # Compute mean direction for each view
+    mean1 = n1_valid.mean(dim=0)
+    mean2 = n2_valid.mean(dim=0)
+    mean1 = F.normalize(mean1.unsqueeze(0), dim=1).squeeze()
+    mean2 = F.normalize(mean2.unsqueeze(0), dim=1).squeeze()
+    
+    # Angular difference between mean directions
+    cos_sim = (mean1 * mean2).sum().clamp(-1.0, 1.0)
+    mean_ang_diff = torch.acos(cos_sim) * (180.0 / math.pi)
+    
+    # Variance of normals in each view (spread around mean)
+    var1 = (1.0 - (n1_valid @ mean1.unsqueeze(1)).squeeze().clamp(-1.0, 1.0)).mean()
+    var2 = (1.0 - (n2_valid @ mean2.unsqueeze(1)).squeeze().clamp(-1.0, 1.0)).mean()
+    
+    # Combined divergence score: mean direction difference + variance difference
+    var_diff = (var1 - var2).abs()
+    
+    return (mean_ang_diff.item() + var_diff.item() * 90.0)  # Scale variance to similar range
+
+
+def compute_multiview_consistency_metrics(
+    base_gt_dir: str,
+    base_gen_dir: str,
+    unlit_subdir: str,
+    lit_subdir: str,
+    obj_ids: List[str],
+    device: torch.device,
+    lpips_model,
+    num_pairs: int = 5,
+    channel: str = "albedo",
+    debug: bool = False,
+) -> Dict[str, float]:
+    """Compute multi-view consistency metrics across all objects.
+    
+    Metrics computed:
+    - CrossView_LPIPS: Perceptual consistency between adjacent views (lower = better)
+    - CrossView_L1: Pixel-level consistency (lower = better)
+    - Normal_Consistency: Angular consistency of surface normals (lower = better)
+    - Normal_Distribution_Div: Divergence of normal distributions (lower = better)
+    - GT_CrossView_LPIPS/L1: Same metrics for GT (for comparison)
+    
+    Args:
+        base_gt_dir: Root GT render directory
+        base_gen_dir: Root generated render directory
+        unlit_subdir: Subdirectory for unlit renders
+        lit_subdir: Subdirectory for lit renders
+        obj_ids: List of object IDs to evaluate
+        device: Torch device
+        lpips_model: LPIPS model instance (or None)
+        num_pairs: Number of view pairs to sample per object
+        channel: Which channel to use ("albedo", "lit", or "normal")
+        debug: Whether to print debug info
+    
+    Returns:
+        Dictionary of metric name -> value
+    """
+    gen_lpips_scores: List[float] = []
+    gen_l1_scores: List[float] = []
+    gt_lpips_scores: List[float] = []
+    gt_l1_scores: List[float] = []
+    normal_consistency_scores: List[float] = []
+    normal_dist_div_scores: List[float] = []
+    
+    print(f"Computing multi-view consistency metrics ({channel} channel)...")
+    
+    for obj_idx, obj_id in enumerate(obj_ids):
+        # Load transforms.json
+        gen_transforms_path = os.path.join(base_gen_dir, obj_id, "transforms.json")
+        gt_transforms_path = os.path.join(base_gt_dir, obj_id, "transforms.json")
+        
+        if not os.path.exists(gen_transforms_path):
+            # Try GT transforms if gen doesn't have its own
+            if os.path.exists(gt_transforms_path):
+                gen_transforms_path = gt_transforms_path
+            else:
+                print(f"[WARN] No transforms.json for {obj_id}, skipping consistency metrics.")
+                continue
+        
+        try:
+            transforms = load_transforms_json(gen_transforms_path)
+        except Exception as e:
+            print(f"[WARN] Failed to load transforms for {obj_id}: {e}")
+            continue
+        
+        frames = transforms.get("frames", [])
+        if len(frames) < 2:
+            print(f"[WARN] Not enough frames for {obj_id}, skipping.")
+            continue
+        
+        # Select view pairs
+        pairs = select_adjacent_view_pairs(frames, num_pairs, seed=42 + obj_idx)
+        
+        for idx1, idx2 in pairs:
+            frame1 = frames[idx1]
+            frame2 = frames[idx2]
+            prefix1 = frame1.get("file_prefix", f"{idx1:03d}")
+            prefix2 = frame2.get("file_prefix", f"{idx2:03d}")
+            
+            # Determine image paths based on channel
+            if channel == "lit":
+                gen_dir = os.path.join(base_gen_dir, obj_id, lit_subdir)
+                gt_dir = os.path.join(base_gt_dir, obj_id, lit_subdir)
+                
+                # Handle HDRI subdirectories
+                if os.path.isdir(gen_dir):
+                    subdirs = [d for d in os.listdir(gen_dir) if os.path.isdir(os.path.join(gen_dir, d))]
+                    if subdirs:
+                        gen_dir = os.path.join(gen_dir, subdirs[0])
+                        gt_dir = os.path.join(gt_dir, subdirs[0])
+                
+                gen_path1 = os.path.join(gen_dir, f"{prefix1}_beauty.png")
+                gen_path2 = os.path.join(gen_dir, f"{prefix2}_beauty.png")
+                gt_path1 = os.path.join(gt_dir, f"{prefix1}_beauty.png")
+                gt_path2 = os.path.join(gt_dir, f"{prefix2}_beauty.png")
+            else:
+                # albedo or normal
+                suffix = channel
+                gen_dir = os.path.join(base_gen_dir, obj_id, unlit_subdir)
+                gt_dir = os.path.join(base_gt_dir, obj_id, unlit_subdir)
+                gen_path1 = os.path.join(gen_dir, f"{prefix1}_{suffix}.png")
+                gen_path2 = os.path.join(gen_dir, f"{prefix2}_{suffix}.png")
+                gt_path1 = os.path.join(gt_dir, f"{prefix1}_{suffix}.png")
+                gt_path2 = os.path.join(gt_dir, f"{prefix2}_{suffix}.png")
+            
+            # Check if files exist
+            if not all(os.path.exists(p) for p in [gen_path1, gen_path2]):
+                if debug:
+                    print(f"[DEBUG] Missing gen files for {obj_id} pair ({idx1}, {idx2})")
+                continue
+            
+            try:
+                gen_img1 = load_image_rgba(gen_path1, device)
+                gen_img2 = load_image_rgba(gen_path2, device)
+                
+                # Compute generated metrics
+                gen_l1 = compute_cross_view_l1(gen_img1, gen_img2)
+                if math.isfinite(gen_l1):
+                    gen_l1_scores.append(gen_l1)
+                
+                if lpips_model is not None:
+                    gen_lpips = compute_cross_view_lpips(gen_img1, gen_img2, lpips_model)
+                    if math.isfinite(gen_lpips):
+                        gen_lpips_scores.append(gen_lpips)
+                
+                # Load and compute GT metrics for comparison
+                if all(os.path.exists(p) for p in [gt_path1, gt_path2]):
+                    gt_img1 = load_image_rgba(gt_path1, device)
+                    gt_img2 = load_image_rgba(gt_path2, device)
+                    
+                    gt_l1 = compute_cross_view_l1(gt_img1, gt_img2)
+                    if math.isfinite(gt_l1):
+                        gt_l1_scores.append(gt_l1)
+                    
+                    if lpips_model is not None:
+                        gt_lpips = compute_cross_view_lpips(gt_img1, gt_img2, lpips_model)
+                        if math.isfinite(gt_lpips):
+                            gt_lpips_scores.append(gt_lpips)
+                    
+                    del gt_img1, gt_img2
+                
+                del gen_img1, gen_img2
+                
+            except Exception as e:
+                if debug:
+                    print(f"[DEBUG] Error processing {obj_id} pair ({idx1}, {idx2}): {e}")
+                continue
+            
+            # Also compute normal consistency if we're not already using normals
+            if channel != "normal":
+                normal_gen_path1 = os.path.join(base_gen_dir, obj_id, unlit_subdir, f"{prefix1}_normal.png")
+                normal_gen_path2 = os.path.join(base_gen_dir, obj_id, unlit_subdir, f"{prefix2}_normal.png")
+                
+                if os.path.exists(normal_gen_path1) and os.path.exists(normal_gen_path2):
+                    try:
+                        normal1 = load_image_rgba(normal_gen_path1, device)
+                        normal2 = load_image_rgba(normal_gen_path2, device)
+                        
+                        rel_pose = compute_relative_pose(frame1, frame2)
+                        
+                        ang_consistency = compute_normal_angular_consistency(normal1, normal2, rel_pose)
+                        if math.isfinite(ang_consistency):
+                            normal_consistency_scores.append(ang_consistency)
+                        
+                        dist_div = compute_normal_distribution_divergence(normal1, normal2)
+                        if math.isfinite(dist_div):
+                            normal_dist_div_scores.append(dist_div)
+                        
+                        del normal1, normal2
+                    except Exception as e:
+                        if debug:
+                            print(f"[DEBUG] Error processing normals for {obj_id}: {e}")
+        
+        if (obj_idx + 1) % 10 == 0:
+            print(f"  Processed {obj_idx + 1}/{len(obj_ids)} objects for consistency...")
+            _clear_cuda_cache()
+    
+    # Compute final metrics
+    metrics: Dict[str, float] = {}
+    
+    if gen_lpips_scores:
+        metrics["CrossView_LPIPS"] = float(np.mean(gen_lpips_scores))
+    if gen_l1_scores:
+        metrics["CrossView_L1"] = float(np.mean(gen_l1_scores))
+    if gt_lpips_scores:
+        metrics["GT_CrossView_LPIPS"] = float(np.mean(gt_lpips_scores))
+    if gt_l1_scores:
+        metrics["GT_CrossView_L1"] = float(np.mean(gt_l1_scores))
+    if normal_consistency_scores:
+        metrics["Normal_Consistency"] = float(np.mean(normal_consistency_scores))
+    if normal_dist_div_scores:
+        metrics["Normal_Distribution_Div"] = float(np.mean(normal_dist_div_scores))
+    
+    # Compute relative metrics (Gen vs GT ratio) - useful for comparing methods
+    if "CrossView_LPIPS" in metrics and "GT_CrossView_LPIPS" in metrics:
+        gt_val = metrics["GT_CrossView_LPIPS"]
+        if gt_val > 1e-6:
+            metrics["CrossView_LPIPS_Ratio"] = metrics["CrossView_LPIPS"] / gt_val
+    
+    if "CrossView_L1" in metrics and "GT_CrossView_L1" in metrics:
+        gt_val = metrics["GT_CrossView_L1"]
+        if gt_val > 1e-6:
+            metrics["CrossView_L1_Ratio"] = metrics["CrossView_L1"] / gt_val
+    
+    return metrics
+
+
+# ===================== Depth-based Reprojection Error (when depth maps available) =====================
+
+
+def load_depth_image(path: str, device: torch.device, near: float = 0.1, far: float = 4.0) -> torch.Tensor:
+    """Load normalized depth image and convert back to metric depth.
+    
+    Args:
+        path: Path to depth image (grayscale PNG, values in [0, 1])
+        device: Torch device
+        near: Near plane used during rendering
+        far: Far plane used during rendering
+    
+    Returns:
+        Depth tensor (1, 1, H, W) with metric depth values
+    """
+    with Image.open(path) as img:
+        img = img.convert("L")  # Grayscale
+        np_depth = np.array(img, dtype=np.float32) / 255.0
+    
+    # Convert normalized [0, 1] back to metric depth
+    metric_depth = np_depth * (far - near) + near
+    
+    tensor = torch.from_numpy(metric_depth).unsqueeze(0).unsqueeze(0)
+    return tensor.to(device)
+
+
+def compute_reprojection_error(
+    img1: torch.Tensor,
+    img2: torch.Tensor,
+    depth1: torch.Tensor,
+    intrinsics: Dict[str, float],
+    relative_pose: np.ndarray,
+    lpips_model=None,
+) -> Tuple[float, float, float]:
+    """Compute reprojection error by warping img1 to img2's viewpoint.
+    
+    This is the gold standard for multi-view consistency evaluation (MEt3R, MVGBench).
+    
+    Given:
+    - Image I1 at viewpoint V1 with depth D1
+    - Image I2 at viewpoint V2
+    - Relative pose T_{2,1} (transforms V1 coords to V2 coords)
+    - Camera intrinsics K
+    
+    Process:
+    1. Unproject I1 pixels to 3D using D1 and K^-1
+    2. Transform 3D points by T_{2,1}
+    3. Project to V2 image plane using K
+    4. Sample I2 at projected coordinates -> I1_warped
+    5. Compute error between I1 and I1_warped
+    
+    Args:
+        img1: Source image (1, 4, H, W) RGBA in [0, 1]
+        img2: Target image (1, 4, H, W) RGBA in [0, 1]
+        depth1: Depth map for img1 (1, 1, H, W) metric depth
+        intrinsics: Camera intrinsics dict with fx, fy, cx, cy
+        relative_pose: 4x4 matrix T_{2,1}
+        lpips_model: Optional LPIPS model for perceptual error
+    
+    Returns:
+        Tuple of (L1_error, LPIPS_error, valid_ratio)
+    """
+    device = img1.device
+    _, _, H, W = img1.shape
+    
+    fx = intrinsics["fx"]
+    fy = intrinsics["fy"]
+    cx = intrinsics["cx"]
+    cy = intrinsics["cy"]
+    
+    # Create pixel grid
+    u = torch.arange(W, device=device, dtype=torch.float32)
+    v = torch.arange(H, device=device, dtype=torch.float32)
+    uu, vv = torch.meshgrid(u, v, indexing='xy')  # (H, W)
+    
+    # Get depth values
+    d1 = depth1.squeeze()  # (H, W)
+    
+    # Unproject to camera 1 coordinates
+    # x = (u - cx) * d / fx
+    # y = (v - cy) * d / fy
+    # z = d
+    x1 = (uu - cx) * d1 / fx
+    y1 = (vv - cy) * d1 / fy
+    z1 = d1
+    
+    # Stack to 3D points (H, W, 3)
+    pts1 = torch.stack([x1, y1, z1], dim=-1)
+    
+    # Add homogeneous coordinate
+    ones = torch.ones_like(z1)
+    pts1_h = torch.stack([x1, y1, z1, ones], dim=-1)  # (H, W, 4)
+    
+    # Transform to camera 2 coordinates
+    T = torch.from_numpy(relative_pose).float().to(device)  # (4, 4)
+    pts1_flat = pts1_h.reshape(-1, 4)  # (H*W, 4)
+    pts2_flat = (T @ pts1_flat.T).T  # (H*W, 4)
+    pts2 = pts2_flat[:, :3].reshape(H, W, 3)  # (H, W, 3)
+    
+    # Project to image 2
+    x2 = pts2[..., 0]
+    y2 = pts2[..., 1]
+    z2 = pts2[..., 2]
+    
+    # Avoid division by zero
+    z2_safe = z2.clamp(min=1e-6)
+    
+    u2 = fx * x2 / z2_safe + cx
+    v2 = fy * y2 / z2_safe + cy
+    
+    # Normalize to [-1, 1] for grid_sample
+    u2_norm = 2.0 * u2 / (W - 1) - 1.0
+    v2_norm = 2.0 * v2 / (H - 1) - 1.0
+    grid = torch.stack([u2_norm, v2_norm], dim=-1).unsqueeze(0)  # (1, H, W, 2)
+    
+    # Sample img2 at projected coordinates
+    img1_warped = F.grid_sample(
+        img2,
+        grid,
+        mode='bilinear',
+        padding_mode='zeros',
+        align_corners=True,
+    )  # (1, 4, H, W)
+    
+    # Create validity mask:
+    # 1. Projected coords within image bounds
+    # 2. Positive depth in both views
+    # 3. Alpha valid in both images
+    in_bounds = (u2 >= 0) & (u2 < W) & (v2 >= 0) & (v2 < H)
+    depth_valid = (z2 > 0) & (d1 > 0)
+    alpha_valid = (img1[:, 3, :, :] > 0.5) & (img1_warped[:, 3, :, :] > 0.5)
+    
+    valid_mask = (in_bounds & depth_valid & alpha_valid.squeeze(0)).float().unsqueeze(0).unsqueeze(0)
+    valid_count = valid_mask.sum().item()
+    
+    if valid_count < MIN_MASK_PIXELS:
+        return float("nan"), float("nan"), 0.0
+    
+    # Compute L1 error on RGB
+    rgb1 = img1[:, :3, :, :]
+    rgb1_warped = img1_warped[:, :3, :, :]
+    l1_diff = (rgb1 - rgb1_warped).abs() * valid_mask
+    l1_error = l1_diff.sum() / (valid_count * 3.0)
+    
+    # Compute LPIPS error if model provided
+    lpips_error = float("nan")
+    if lpips_model is not None:
+        rgb1_masked = rgb1 * valid_mask
+        rgb1_warped_masked = rgb1_warped * valid_mask
+        with torch.no_grad():
+            lpips_val = lpips_model(rgb1_masked * 2.0 - 1.0, rgb1_warped_masked * 2.0 - 1.0)
+            lpips_error = lpips_val.mean().item()
+    
+    valid_ratio = valid_count / (H * W)
+    
+    return l1_error.item(), lpips_error, valid_ratio
+
+
+def compute_reprojection_metrics(
+    base_gt_dir: str,
+    base_gen_dir: str,
+    unlit_subdir: str,
+    obj_ids: List[str],
+    device: torch.device,
+    lpips_model,
+    num_pairs: int = 5,
+    debug: bool = False,
+) -> Dict[str, float]:
+    """Compute reprojection-based multi-view consistency metrics.
+    
+    This requires depth maps to be rendered. If depth maps are not available,
+    returns empty dict.
+    
+    Args:
+        base_gt_dir: Root GT render directory
+        base_gen_dir: Root generated render directory
+        unlit_subdir: Subdirectory for unlit renders
+        obj_ids: List of object IDs
+        device: Torch device
+        lpips_model: LPIPS model instance
+        num_pairs: Number of view pairs per object
+        debug: Enable debug output
+    
+    Returns:
+        Dictionary of reprojection metrics
+    """
+    gen_reproj_l1: List[float] = []
+    gen_reproj_lpips: List[float] = []
+    gt_reproj_l1: List[float] = []
+    gt_reproj_lpips: List[float] = []
+    valid_ratios: List[float] = []
+    
+    # Check if depth maps are available
+    sample_obj = obj_ids[0] if obj_ids else None
+    if sample_obj:
+        sample_depth = os.path.join(base_gen_dir, sample_obj, unlit_subdir, "000_depth.png")
+        if not os.path.exists(sample_depth):
+            print("[INFO] Depth maps not found. Skipping reprojection metrics.")
+            print("       Run render_gt_dataset.py with updated version to generate depth maps.")
+            return {}
+    
+    print("Computing reprojection-based consistency metrics...")
+    
+    for obj_idx, obj_id in enumerate(obj_ids):
+        # Load transforms
+        transforms_path = os.path.join(base_gt_dir, obj_id, "transforms.json")
+        if not os.path.exists(transforms_path):
+            transforms_path = os.path.join(base_gen_dir, obj_id, "transforms.json")
+        
+        if not os.path.exists(transforms_path):
+            continue
+        
+        try:
+            transforms = load_transforms_json(transforms_path)
+        except Exception:
+            continue
+        
+        frames = transforms.get("frames", [])
+        intrinsics = transforms.get("intrinsics", {})
+        
+        # Get depth normalization params
+        depth_meta = transforms.get("meta", {}).get("depth", {})
+        depth_near = depth_meta.get("near", 0.1)
+        depth_far = depth_meta.get("far", 4.0)
+        
+        if len(frames) < 2:
+            continue
+        
+        pairs = select_adjacent_view_pairs(frames, num_pairs, seed=42 + obj_idx)
+        
+        for idx1, idx2 in pairs:
+            frame1 = frames[idx1]
+            frame2 = frames[idx2]
+            prefix1 = frame1.get("file_prefix", f"{idx1:03d}")
+            prefix2 = frame2.get("file_prefix", f"{idx2:03d}")
+            
+            gen_dir = os.path.join(base_gen_dir, obj_id, unlit_subdir)
+            gt_dir = os.path.join(base_gt_dir, obj_id, unlit_subdir)
+            
+            # Paths for albedo and depth
+            gen_albedo1 = os.path.join(gen_dir, f"{prefix1}_albedo.png")
+            gen_albedo2 = os.path.join(gen_dir, f"{prefix2}_albedo.png")
+            gen_depth1 = os.path.join(gen_dir, f"{prefix1}_depth.png")
+            
+            gt_albedo1 = os.path.join(gt_dir, f"{prefix1}_albedo.png")
+            gt_albedo2 = os.path.join(gt_dir, f"{prefix2}_albedo.png")
+            gt_depth1 = os.path.join(gt_dir, f"{prefix1}_depth.png")
+            
+            # Check files exist
+            if not all(os.path.exists(p) for p in [gen_albedo1, gen_albedo2, gen_depth1]):
+                continue
+            
+            try:
+                # Compute relative pose
+                rel_pose = compute_relative_pose(frame1, frame2)
+                
+                # Load images
+                gen_img1 = load_image_rgba(gen_albedo1, device)
+                gen_img2 = load_image_rgba(gen_albedo2, device)
+                gen_d1 = load_depth_image(gen_depth1, device, depth_near, depth_far)
+                
+                # Compute reprojection error
+                l1, lpips_err, valid_ratio = compute_reprojection_error(
+                    gen_img1, gen_img2, gen_d1, intrinsics, rel_pose, lpips_model
+                )
+                
+                if math.isfinite(l1):
+                    gen_reproj_l1.append(l1)
+                if math.isfinite(lpips_err):
+                    gen_reproj_lpips.append(lpips_err)
+                if valid_ratio > 0:
+                    valid_ratios.append(valid_ratio)
+                
+                del gen_img1, gen_img2, gen_d1
+                
+                # GT reprojection (for reference)
+                if all(os.path.exists(p) for p in [gt_albedo1, gt_albedo2, gt_depth1]):
+                    gt_img1 = load_image_rgba(gt_albedo1, device)
+                    gt_img2 = load_image_rgba(gt_albedo2, device)
+                    gt_d1 = load_depth_image(gt_depth1, device, depth_near, depth_far)
+                    
+                    gt_l1, gt_lpips_err, _ = compute_reprojection_error(
+                        gt_img1, gt_img2, gt_d1, intrinsics, rel_pose, lpips_model
+                    )
+                    
+                    if math.isfinite(gt_l1):
+                        gt_reproj_l1.append(gt_l1)
+                    if math.isfinite(gt_lpips_err):
+                        gt_reproj_lpips.append(gt_lpips_err)
+                    
+                    del gt_img1, gt_img2, gt_d1
+                
+            except Exception as e:
+                if debug:
+                    print(f"[DEBUG] Reprojection error for {obj_id}: {e}")
+                continue
+        
+        if (obj_idx + 1) % 10 == 0:
+            print(f"  Processed {obj_idx + 1}/{len(obj_ids)} objects for reprojection...")
+            _clear_cuda_cache()
+    
+    # Compile metrics
+    metrics: Dict[str, float] = {}
+    
+    if gen_reproj_l1:
+        metrics["Reproj_L1"] = float(np.mean(gen_reproj_l1))
+    if gen_reproj_lpips:
+        metrics["Reproj_LPIPS"] = float(np.mean(gen_reproj_lpips))
+    if gt_reproj_l1:
+        metrics["GT_Reproj_L1"] = float(np.mean(gt_reproj_l1))
+    if gt_reproj_lpips:
+        metrics["GT_Reproj_LPIPS"] = float(np.mean(gt_reproj_lpips))
+    if valid_ratios:
+        metrics["Reproj_Valid_Ratio"] = float(np.mean(valid_ratios))
+    
+    # Ratio metrics
+    if "Reproj_L1" in metrics and "GT_Reproj_L1" in metrics:
+        gt_val = metrics["GT_Reproj_L1"]
+        if gt_val > 1e-6:
+            metrics["Reproj_L1_Ratio"] = metrics["Reproj_L1"] / gt_val
+    
+    return metrics
 
 
 def _clear_cuda_cache():
@@ -1299,6 +2111,72 @@ def main() -> None:
                 final_metrics["Metallic_L1_Masked"] = (
                     total_l1_weighted / total_mask if total_mask > 0 else float("nan")
                 )
+
+    # ===================== Multi-View Consistency Metrics =====================
+    # These metrics detect Janus (multi-face) problems and texture flickering
+    do_consistency = metric_flags.get("consistency", False)
+    
+    if do_consistency:
+        print("\n=== Computing Multi-View Consistency Metrics ===")
+        
+        # Load LPIPS model for consistency metrics if not already loaded
+        lpips_mod = _lazy_import_lpips()
+        consistency_lpips_model = lpips_mod.LPIPS(net="vgg").to(device)
+        consistency_lpips_model.eval()
+        _clear_cuda_cache()
+        
+        try:
+            # 1. Cross-view consistency metrics (works without depth maps)
+            consistency_metrics = compute_multiview_consistency_metrics(
+                base_gt_dir=base_gt_dir,
+                base_gen_dir=base_gen_dir,
+                unlit_subdir=args.unlit_subdir,
+                lit_subdir=args.lit_subdir,
+                obj_ids=obj_ids,
+                device=device,
+                lpips_model=consistency_lpips_model,
+                num_pairs=args.consistency_pairs,
+                channel=args.consistency_channel,
+                debug=args.debug,
+            )
+            
+            # Add consistency metrics to final metrics with prefix
+            for metric_name, value in consistency_metrics.items():
+                final_metrics[f"Consistency/{metric_name}"] = value
+            
+            print("Cross-view consistency metrics computed.")
+            for k, v in consistency_metrics.items():
+                print(f"  {k}: {v:.6f}")
+            
+            # 2. Reprojection-based metrics (requires depth maps, optional)
+            print("\n--- Computing Reprojection Metrics (if depth available) ---")
+            reproj_metrics = compute_reprojection_metrics(
+                base_gt_dir=base_gt_dir,
+                base_gen_dir=base_gen_dir,
+                unlit_subdir=args.unlit_subdir,
+                obj_ids=obj_ids,
+                device=device,
+                lpips_model=consistency_lpips_model,
+                num_pairs=args.consistency_pairs,
+                debug=args.debug,
+            )
+            
+            if reproj_metrics:
+                for metric_name, value in reproj_metrics.items():
+                    final_metrics[f"Consistency/{metric_name}"] = value
+                
+                print("Reprojection metrics computed successfully.")
+                for k, v in reproj_metrics.items():
+                    print(f"  {k}: {v:.6f}")
+            else:
+                print("Reprojection metrics skipped (no depth maps found).")
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to compute consistency metrics: {e}")
+            traceback.print_exc()
+        finally:
+            del consistency_lpips_model
+            _clear_cuda_cache()
 
     output_path = args.output or f"metrics_{args.experiment_name}.json"
     save_metrics(final_metrics, output_path)

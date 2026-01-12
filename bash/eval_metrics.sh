@@ -33,32 +33,40 @@ LONGCLIP_CONTEXT_LENGTH="${LONGCLIP_CONTEXT_LENGTH:-248}"
 OUTPUT="${OUTPUT:-"../experiments/${EXPERIMENT_NAME}/metrics_${EXPERIMENT_NAME}.json"}"
 PROMPTS_FILE="${PROMPTS_FILE:-"../experiments/${EXPERIMENT_NAME}/generated_manifest.tsv"}"
 
+# 多视角一致性指标参数 (CVPR 2025 / ECCV 2024-2025 标准)
+# 用于检测 Janus (多面怪) 问题和纹理闪烁
+CONSISTENCY_PAIRS="${CONSISTENCY_PAIRS:-10}"           # 每个物体采样的相邻视角对数量
+CONSISTENCY_CHANNEL="${CONSISTENCY_CHANNEL:-albedo}" # 一致性评估使用的通道: albedo/lit/normal
+
 # 启用 CUDA 同步调用（更稳定但更慢）
 export CUDA_LAUNCH_BLOCKING=1
 
 # 指标选择:
-# - 预设: all | pixel (psnr,ssim,lpips) | dist (fid,kid) | semantic (clip)
-# - 自定义逗号列表: 例如 psnr,ssim,clip
+# - 预设: all | pixel (psnr,ssim,lpips) | dist (fid,kid) | semantic (clip) | consistency (多视角)
+# - 自定义逗号列表: 例如 psnr,ssim,clip,consistency
+# - 一致性指标包括: CrossView_LPIPS, CrossView_L1, Normal_Consistency, Reproj_L1 (需深度图)
 METRICS="${METRICS:-all}"
 
 echo "=============================================="
 echo "Evaluate Metrics"
-echo "Experiment:    $EXPERIMENT_NAME"
-echo "GT Dir:        $BASE_GT_DIR"
-echo "Gen Dir:       $BASE_GEN_DIR"
-echo "Lit Subdir:    $LIT_SUBDIR"
-echo "Unlit Subdir:  $UNLIT_SUBDIR"
-echo "Batch size:    $BATCH_SIZE"
-echo "Device:        $DEVICE"
-echo "KID subset:    $KID_SUBSET_SIZE"
-echo "CLIP model:    $CLIP_MODEL"
-echo "LongCLIP ckpt: $LONGCLIP_MODEL"
-echo "LongCLIP root: $LONGCLIP_ROOT"
-echo "LongCLIP ctx:  $LONGCLIP_CONTEXT_LENGTH"
-echo "Prompts file:  $PROMPTS_FILE"
-echo "Metrics:       $METRICS"
-echo "Output:        $OUTPUT"
-echo "Conda env:     $ENV_NAME"
+echo "Experiment:         $EXPERIMENT_NAME"
+echo "GT Dir:             $BASE_GT_DIR"
+echo "Gen Dir:            $BASE_GEN_DIR"
+echo "Lit Subdir:         $LIT_SUBDIR"
+echo "Unlit Subdir:       $UNLIT_SUBDIR"
+echo "Batch size:         $BATCH_SIZE"
+echo "Device:             $DEVICE"
+echo "KID subset:         $KID_SUBSET_SIZE"
+echo "CLIP model:         $CLIP_MODEL"
+echo "LongCLIP ckpt:      $LONGCLIP_MODEL"
+echo "LongCLIP root:      $LONGCLIP_ROOT"
+echo "LongCLIP ctx:       $LONGCLIP_CONTEXT_LENGTH"
+echo "Prompts file:       $PROMPTS_FILE"
+echo "Metrics:            $METRICS"
+echo "Consistency pairs:  $CONSISTENCY_PAIRS"
+echo "Consistency chan:   $CONSISTENCY_CHANNEL"
+echo "Output:             $OUTPUT"
+echo "Conda env:          $ENV_NAME"
 echo "=============================================="
 
 # 创建日志文件
@@ -91,6 +99,8 @@ CUDA_VISIBLE_DEVICES=0 python -u scripts/eval_metrics.py \
   --longclip_context_length "$LONGCLIP_CONTEXT_LENGTH" \
   --prompts_file "$PROMPTS_FILE" \
   --metrics "$METRICS" \
+  --consistency_pairs "$CONSISTENCY_PAIRS" \
+  --consistency_channel "$CONSISTENCY_CHANNEL" \
   --output "$OUTPUT" \
   2>&1 | tee "$LOG_FILE"
 
