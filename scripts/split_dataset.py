@@ -38,13 +38,21 @@ def main():
                         default="../experiments/common_splits", 
                         help="Directory to save train.tsv, val.tsv, test.tsv")
 
-    # 划分比例
-    parser.add_argument("--ratios", nargs=3, type=float, default=[0.8, 0.1, 0.1], 
-                        help="Train Val Test ratios (default: 0.8 0.1 0.1)")
+    # 划分比例（未指定 --counts 时生效）
+    parser.add_argument("--ratios", nargs=3, type=float, default=[0.8, 0.1, 0.1],
+                        help="Train Val Test ratios (used when --counts is not set)")
     
     # 随机种子：固定为 42 以保证可复现性
     parser.add_argument("--seed", type=int, default=42, 
                         help="Random seed for splitting (Keep it fixed for fair comparison!)")
+
+    # Optional: limit how many samples to take from the manifest before splitting
+    parser.add_argument("--max-samples", type=int, default=0,
+                        help="Limit number of samples from manifest before splitting (0 = all)")
+
+    # 指定 train/val/test 的数量（优先级高于 --ratios）
+    parser.add_argument("--counts", nargs=3, type=int, default=None,
+                        help="Train Val Test counts (overrides --ratios)")
     
     args = parser.parse_args()
 
@@ -146,19 +154,48 @@ def main():
         print("[Error] No valid data found! Check your paths.")
         return
 
+    if args.max_samples < 0:
+        print("[Error] --max-samples must be >= 0")
+        return
+
+    if args.counts is not None:
+        if any(c < 0 for c in args.counts):
+            print("[Error] --counts must be >= 0")
+            return
+        if sum(args.counts) == 0:
+            print("[Error] --counts sum must be > 0")
+            return
+
     # ================= 3. 随机切分 =================
     random.seed(args.seed)
     random.shuffle(valid_data)
 
-    total_r = sum(args.ratios)
-    n_train = int(total * (args.ratios[0] / total_r))
-    n_val = int(total * (args.ratios[1] / total_r))
-    # Test 拿剩余所有，避免舍入误差丢数据
+    if args.max_samples and args.max_samples < total:
+        valid_data = valid_data[:args.max_samples]
+        total = len(valid_data)
+        print(f"Limiting split to {total} samples via --max-samples.")
+
+    if args.counts is not None:
+        total_requested = sum(args.counts)
+        if total_requested > total:
+            print(f"[Error] --counts sum ({total_requested}) exceeds available samples ({total})")
+            return
+        if total_requested < total:
+            valid_data = valid_data[:total_requested]
+            total = len(valid_data)
+            print(f"Limiting split to {total} samples via --counts.")
+        n_train, n_val, n_test = args.counts
+    else:
+        total_r = sum(args.ratios)
+        n_train = int(total * (args.ratios[0] / total_r))
+        n_val = int(total * (args.ratios[1] / total_r))
+        # Test 拿剩余所有，避免舍入误差丢数据
+        n_test = total - n_train - n_val
     
     splits = {
         "train": valid_data[:n_train],
         "val":   valid_data[n_train : n_train + n_val],
-        "test":  valid_data[n_train + n_val :]
+        "test":  valid_data[n_train + n_val : n_train + n_val + n_test]
     }
 
     # ================= 4. 保存结果 =================
@@ -177,6 +214,8 @@ def main():
         f.write(f"Source Manifest: {manifest_path}\n")
         f.write(f"Seed: {args.seed}\n")
         f.write(f"Ratios: {args.ratios}\n")
+        f.write(f"Max Samples: {args.max_samples}\n")
+        f.write(f"Counts Requested: {args.counts}\n")
         f.write(f"Counts: Train={len(splits['train'])}, Val={len(splits['val'])}, Test={len(splits['test'])}\n")
 
     print(f"\n[Success] Common splits generated at: {args.out_dir}")

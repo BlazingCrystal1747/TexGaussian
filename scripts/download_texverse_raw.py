@@ -264,6 +264,69 @@ def log_skip(log_f, obj_id, reason, detail=""):
     log_f.write(message + "\n")
     log_f.flush()
 
+def load_existing_manifest(path: str):
+    if not os.path.isfile(path):
+        return [], set()
+    entries = []
+    seen = set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            fieldnames = reader.fieldnames or []
+            required = ("rel_glb", "caption_short", "caption_long", "obj_id")
+            missing = [name for name in required if name not in fieldnames]
+            if missing:
+                print(f"[Warn] Existing manifest missing columns: {', '.join(missing)}. Ignoring it.")
+                return [], set()
+            for row in reader:
+                obj_id = (row.get("obj_id") or "").strip()
+                rel_glb = (row.get("rel_glb") or "").strip()
+                if not obj_id or not rel_glb:
+                    continue
+                if obj_id in seen:
+                    continue
+                entries.append({
+                    "obj_id": obj_id,
+                    "rel_glb": rel_glb,
+                    "caption_short": row.get("caption_short", ""),
+                    "caption_long": row.get("caption_long", ""),
+                })
+                seen.add(obj_id)
+    except Exception as e:
+        print(f"[Warn] Failed to read existing manifest: {e}. Ignoring it.")
+        return [], set()
+    return entries, seen
+
+def load_resume_state(path: str):
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        order = state.get("order")
+        next_index = state.get("next_index", 0)
+        if not isinstance(order, list):
+            return None
+        return {
+            "order": order,
+            "next_index": int(next_index) if isinstance(next_index, int) else 0,
+            "seed": state.get("seed"),
+        }
+    except Exception as e:
+        print(f"[Warn] Failed to read resume file: {e}. Rebuilding shuffle order.")
+        return None
+
+def save_resume_state(path: str, order, next_index: int, seed: int):
+    state = {
+        "seed": seed,
+        "next_index": int(next_index),
+        "order": order,
+    }
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=True)
+    os.replace(tmp_path, path)
+
 def validate_glb_strict(glb_path):
     """
     严格校验 GLB 结构 (Single Mesh, Single Material)
@@ -308,12 +371,23 @@ def main():
     parser.add_argument("--out-dir", default="", help="默认同 data-root")
     parser.add_argument("--total-num", type=int, default=2000, help="目标下载数量")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume-from-manifest", action="store_true",
+                        help="Resume from last obj_id in downloaded_manifest.tsv using resume order")
     args = parser.parse_args()
     
     if not args.out_dir: args.out_dir = args.data_root
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     os.makedirs(args.data_root, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
+
+    out_tsv = os.path.join(args.out_dir, "downloaded_manifest.tsv")
+    existing_list, existing_ids = load_existing_manifest(out_tsv)
+    if existing_list:
+        if len(existing_list) >= args.total_num:
+            print(f"[Skip] Existing manifest has {len(existing_list)} samples >= target {args.total_num}.")
+            print(f"Manifest saved to {out_tsv}")
+            return
+        print(f"Resume from existing manifest: {len(existing_list)} samples (target {args.total_num}).")
     
     # 1. 确保元数据存在
     print(f"Checking metadata in {args.data_root}...")
@@ -379,74 +453,120 @@ def main():
                 "caption": cap
             })
 
-        random.seed(args.seed)
-        random.shuffle(candidates)
-        
+        resume_path = os.path.join(args.out_dir, "download_texverse_raw.resume.json")
+        candidates_by_id = {item["obj_id"]: item for item in candidates}
+        resume_state = load_resume_state(resume_path)
+        start_index = 0
+        order = None
+
+        if resume_state:
+            order = resume_state.get("order", [])
+            if len(order) == len(candidates_by_id) and set(order) == set(candidates_by_id.keys()):
+                candidates = [candidates_by_id[obj_id] for obj_id in order]
+                start_index = max(0, min(resume_state.get("next_index", 0), len(candidates)))
+                print(f"Resume cursor: {start_index}/{len(candidates)}")
+            else:
+                print("[Warn] Resume order mismatch; re-shuffling candidates.")
+                resume_state = None
+                order = None
+
+        if not resume_state:
+            random.seed(args.seed)
+            random.shuffle(candidates)
+            order = [item["obj_id"] for item in candidates]
+            save_resume_state(resume_path, order, 0, args.seed)
+            print(f"Resume file created: {resume_path}")
+
+        if args.resume_from_manifest:
+            if not existing_list:
+                print("[Warn] --resume-from-manifest set but manifest is empty; using resume cursor.")
+            else:
+                last_obj_id = existing_list[-1].get("obj_id")
+                if not last_obj_id:
+                    print("[Warn] --resume-from-manifest missing last obj_id; using resume cursor.")
+                else:
+                    try:
+                        last_pos = order.index(last_obj_id)
+                    except ValueError:
+                        print("[Warn] Last obj_id from manifest not in resume order; using resume cursor.")
+                    else:
+                        start_index = min(last_pos + 1, len(order))
+                        print(f"Resume from manifest: {start_index}/{len(order)}")
+
         # 4. 下载与校验
         print(f"Start verifying... Candidates: {len(candidates)}, Target: {args.total_num}")
-        valid_list = []
-        
-        for item in candidates:
-            if len(valid_list) >= args.total_num: 
-                break
+        valid_list = list(existing_list)
 
-            short_caption, long_caption = parse_captions_natural(item["caption"])
-            if not short_caption or not long_caption:
-                log_skip(log_f, item["obj_id"], "empty caption")
-                continue
+        idx = start_index
+        while idx < len(candidates) and len(valid_list) < args.total_num:
+            item = candidates[idx]
             try:
-                strict_validate(short_caption)
-            except ValueError as e:
-                log_skip(log_f, item["obj_id"], "caption_short too long (tokenized)", str(e))
-                continue
-            except Exception as e:
-                log_skip(log_f, item["obj_id"], "caption_short validation error", str(e))
-                continue
+                if item["obj_id"] in existing_ids:
+                    continue
 
-            try:
-                strict_validate(
-                    long_caption,
-                    tokenize_fn=longclip_module.tokenize,
-                    context_length=DEFAULT_LONGCLIP_CONTEXT_LENGTH,
-                    label="caption_long",
-                    require_context_length=True,
-                )
-            except ValueError as e:
-                log_skip(log_f, item["obj_id"], "caption_long too long (tokenized)", str(e))
-                continue
-            except Exception as e:
-                log_skip(log_f, item["obj_id"], "caption_long validation error", str(e))
-                continue
-            
-            try:
-                # 下载具体文件
-                local_path = hf_hub_download(
-                    repo_id=args.repo, repo_type="dataset", 
-                    filename=item["rel_glb"], local_dir=args.data_root
-                )
+                short_caption, long_caption = parse_captions_natural(item["caption"])
+                if not short_caption or not long_caption:
+                    log_skip(log_f, item["obj_id"], "empty caption")
+                    continue
+                try:
+                    strict_validate(short_caption)
+                except ValueError as e:
+                    log_skip(log_f, item["obj_id"], "caption_short too long (tokenized)", str(e))
+                    continue
+                except Exception as e:
+                    log_skip(log_f, item["obj_id"], "caption_short validation error", str(e))
+                    continue
+
+                try:
+                    strict_validate(
+                        long_caption,
+                        tokenize_fn=longclip_module.tokenize,
+                        context_length=DEFAULT_LONGCLIP_CONTEXT_LENGTH,
+                        label="caption_long",
+                        require_context_length=True,
+                    )
+                except ValueError as e:
+                    log_skip(log_f, item["obj_id"], "caption_long too long (tokenized)", str(e))
+                    continue
+                except Exception as e:
+                    log_skip(log_f, item["obj_id"], "caption_long validation error", str(e))
+                    continue
                 
-                # 严格校验
-                if validate_glb_strict(local_path):
-                    item_clean = {
-                        "obj_id": item["obj_id"],
-                        "rel_glb": item["rel_glb"],
-                        "caption_short": short_caption,
-                        "caption_long": long_caption,
-                    }
-                    valid_list.append(item_clean)
-                    if len(valid_list) % 10 == 0:
-                        print(f"Qualified: {len(valid_list)}/{args.total_num}")
-                else:
-                    # 不合格则删除以节省空间
-                    try:
-                        os.remove(local_path)
-                    except FileNotFoundError:
-                        pass
-                    log_skip(log_f, item["obj_id"], "glb invalid", item["rel_glb"])
+                try:
+                    local_path = os.path.join(args.data_root, item["rel_glb"])
+                    if not os.path.isfile(local_path):
+                        # 下载具体文件
+                        local_path = hf_hub_download(
+                            repo_id=args.repo, repo_type="dataset",
+                            filename=item["rel_glb"], local_dir=args.data_root
+                        )
                     
-            except Exception as e:
-                log_skip(log_f, item["obj_id"], "download fail", str(e))
-                print(f"[Fail] {item['obj_id']}: {e}")
+                    # 严格校验
+                    if validate_glb_strict(local_path):
+                        item_clean = {
+                            "obj_id": item["obj_id"],
+                            "rel_glb": item["rel_glb"],
+                            "caption_short": short_caption,
+                            "caption_long": long_caption,
+                        }
+                        valid_list.append(item_clean)
+                        existing_ids.add(item["obj_id"])
+                        if len(valid_list) % 10 == 0:
+                            print(f"Qualified: {len(valid_list)}/{args.total_num}")
+                    else:
+                        # 不合格则删除以节省空间
+                        try:
+                            os.remove(local_path)
+                        except FileNotFoundError:
+                            pass
+                        log_skip(log_f, item["obj_id"], "glb invalid", item["rel_glb"])
+                        
+                except Exception as e:
+                    log_skip(log_f, item["obj_id"], "download fail", str(e))
+                    print(f"[Fail] {item['obj_id']}: {e}")
+            finally:
+                idx += 1
+                save_resume_state(resume_path, order, idx, args.seed)
 
         # 5. 生成清单
         out_tsv = os.path.join(args.out_dir, "downloaded_manifest.tsv")
