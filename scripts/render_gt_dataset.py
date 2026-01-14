@@ -16,12 +16,16 @@ Output layout:
 import argparse
 import contextlib
 import csv
+import json
 import math
 import os
 import random
 import re
+import subprocess
 import sys
-from typing import Any, Dict, List
+import tempfile
+import threading
+from typing import Any, Dict, List, Optional
 
 import bpy
 from mathutils import Vector
@@ -483,11 +487,20 @@ def build_pbr_material(albedo: str, rough: str, metal: str, normal: str) -> bpy.
     return mat
 
 
-def fibonacci_sphere(samples: int, radius: float, rng: random.Random) -> List[Vector]:
+def fibonacci_sphere(samples: int, radius: float, rnd: float) -> List[Vector]:
+    """Generate camera positions on a fibonacci sphere.
+    
+    Args:
+        samples: Number of camera positions
+        radius: Sphere radius
+        rnd: Random offset value (pre-computed for reproducibility)
+    
+    Returns:
+        List of camera position vectors
+    """
     points = []
     offset = 2.0 / samples
     increment = math.pi * (3.0 - math.sqrt(5.0))
-    rnd = rng.random() * samples
     for i in range(samples):
         y = ((i * offset) - 1.0) + (offset * 0.5)
         r = math.sqrt(max(0.0, 1.0 - y * y))
@@ -577,7 +590,14 @@ def clear_data_blocks() -> None:
 
 
 # ===================== 渲染流程 =====================
-def render_object(row: Dict[str, str], args: argparse.Namespace, rng: random.Random) -> bool:
+def render_object(row: Dict[str, str], args: argparse.Namespace, rnd_value: float) -> bool:
+    """Render a single object with pre-computed random offset.
+    
+    Args:
+        row: Object data from manifest
+        args: Command line arguments
+        rnd_value: Pre-computed random offset for camera positions (for reproducibility)
+    """
     oid = row.get("obj_id", "unknown")
     mesh_path = row.get("mesh")
     albedo = row.get("albedo")
@@ -655,7 +675,7 @@ def render_object(row: Dict[str, str], args: argparse.Namespace, rng: random.Ran
     }
 
     cam = create_camera(scene, args.focal_length)
-    points = fibonacci_sphere(args.views, args.radius, rng)
+    points = fibonacci_sphere(args.views, args.radius, rnd_value)
     intrinsics = compute_intrinsics(cam, scene)
     frames: List[Dict[str, Any]] = []
     frame_views: List[Dict[str, Any]] = []
@@ -798,7 +818,75 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--background", choices=["black", "white", "hdri", "transparent"], default=None, help="Background mode for lit renders (default: hdri).")
     parser.add_argument("--save-blend", action="store_true", help="Save a .blend file per object for inspection.")
     parser.add_argument("--unlit-only", action="store_true", help="Render unlit channels only (skip lit PBR).")
+    # Multi-GPU parallelism arguments
+    parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers (GPUs). Default 1 (serial).")
+    parser.add_argument("--gpu-list", type=str, default=None, help="Comma-separated list of GPU IDs to use (e.g., '0,1,2,3').")
+    # Internal arguments for worker processes
+    parser.add_argument("--shard", type=int, default=None, help="(Internal) Shard index for this worker.")
+    parser.add_argument("--num-shards", type=int, default=None, help="(Internal) Total number of shards.")
+    parser.add_argument("--gpu-id", type=int, default=None, help="(Internal) GPU ID for this worker.")
+    parser.add_argument("--rnd-file", type=str, default=None, help="(Internal) Path to pre-computed rnd values file.")
     return parser.parse_args(argv)
+
+
+def precompute_rnd_values(num_objects: int, seed: int, views: int) -> List[float]:
+    """Pre-compute rnd values for all objects in the same order as serial execution.
+    
+    This ensures that regardless of parallelization, each object gets the same
+    camera positions as it would in serial execution.
+    """
+    rng = random.Random(seed)
+    return [rng.random() * views for _ in range(num_objects)]
+
+
+def launch_worker_subprocess(
+    script_path: str,
+    base_argv: List[str],
+    shard: int,
+    num_shards: int,
+    gpu_id: int,
+    rnd_file: str,
+) -> subprocess.Popen:
+    """Launch a worker subprocess for a specific shard and GPU."""
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    env["PYTHONUNBUFFERED"] = "1"  # Force unbuffered output for real-time logging
+    
+    # Build worker command
+    worker_argv = base_argv + [
+        "--shard", str(shard),
+        "--num-shards", str(num_shards),
+        "--gpu-id", str(gpu_id),
+        "--rnd-file", rnd_file,
+    ]
+    
+    # Determine how to run the script based on how we were invoked
+    python_exe = sys.executable
+    exe_basename = os.path.basename(python_exe).lower()
+    
+    # Check if we're running via "blender --background --python" or directly via "python"
+    # When running via blender, the executable basename is "blender" or "blender.exe"
+    # When running via python (with bpy module installed), the basename is "python" or "python3"
+    if exe_basename.startswith("blender"):
+        # Running via blender --background --python
+        cmd = [python_exe, "--background", "--python", script_path, "--"] + worker_argv
+    else:
+        # Running directly via python (bpy module installed in conda env)
+        cmd = [python_exe, script_path] + worker_argv
+    
+    log(f"Launching worker shard {shard}/{num_shards} on GPU {gpu_id}")
+    return subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+
+
+def stream_worker_output(proc: subprocess.Popen, shard: int) -> None:
+    """Stream output from a worker process in real-time."""
+    try:
+        for line in iter(proc.stdout.readline, b''):
+            if line:
+                print(f"[Worker {shard}] {line.decode('utf-8', errors='replace').rstrip()}")
+        proc.stdout.close()
+    except Exception:
+        pass
 
 
 def main(argv: List[str]) -> None:
@@ -831,7 +919,6 @@ def main(argv: List[str]) -> None:
         args.multi_hdri = False
 
     os.makedirs(args.out_root, exist_ok=True)
-    rng = random.Random(args.seed)
 
     with open(manifest_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t")
@@ -848,20 +935,119 @@ def main(argv: List[str]) -> None:
         tasks.append(new_row)
 
     log(f"Loaded {len(tasks)} entries from manifest.")
+
+    # ========== Multi-GPU parallel mode (master process) ==========
+    is_worker = args.shard is not None and args.num_shards is not None
+    
+    if not is_worker and args.workers > 1:
+        # Master process: pre-compute rnd values and launch workers
+        log(f"Starting parallel rendering with {args.workers} workers...")
+        
+        # Pre-compute rnd values for all objects (same order as serial execution)
+        rnd_values = precompute_rnd_values(len(tasks), args.seed, args.views)
+        
+        # Write rnd values to a temporary file
+        rnd_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+        json.dump(rnd_values, rnd_file)
+        rnd_file.close()
+        rnd_file_path = rnd_file.name
+        
+        try:
+            # Parse GPU list
+            if args.gpu_list:
+                gpu_ids = [int(g.strip()) for g in args.gpu_list.split(",")]
+            else:
+                gpu_ids = list(range(args.workers))
+            
+            if len(gpu_ids) < args.workers:
+                log(f"Warning: only {len(gpu_ids)} GPUs specified for {args.workers} workers")
+                gpu_ids = (gpu_ids * ((args.workers // len(gpu_ids)) + 1))[:args.workers]
+            
+            # Build base argv (exclude worker-specific args)
+            base_argv = [
+                "--manifest", manifest_path,
+                "--out-root", args.out_root,
+                "--resolution", str(args.resolution),
+                "--views", str(args.views),
+                "--radius", str(args.radius),
+                "--focal-length", str(args.focal_length),
+                "--samples", str(args.samples),
+                "--seed", str(args.seed),
+                "--background", args.background,
+            ]
+            if args.unlit_only:
+                base_argv.append("--unlit-only")
+            if args.save_blend:
+                base_argv.append("--save-blend")
+            for entry in args.hdris:
+                base_argv.extend(["--hdri", entry["path"]])
+            
+            # Launch worker processes
+            script_path = os.path.abspath(__file__)
+            processes = []
+            output_threads = []
+            for shard in range(args.workers):
+                gpu_id = gpu_ids[shard]
+                proc = launch_worker_subprocess(
+                    script_path, base_argv, shard, args.workers, gpu_id, rnd_file_path
+                )
+                processes.append((shard, proc))
+                # Start a thread to stream output in real-time
+                t = threading.Thread(target=stream_worker_output, args=(proc, shard), daemon=True)
+                t.start()
+                output_threads.append(t)
+            
+            # Wait for all workers to complete
+            for shard, proc in processes:
+                proc.wait()
+                if proc.returncode != 0:
+                    log(f"Worker {shard} exited with code {proc.returncode}")
+            
+            # Wait for output threads to finish
+            for t in output_threads:
+                t.join(timeout=2.0)
+            
+            log("All workers completed.")
+        finally:
+            # Clean up temporary file
+            if os.path.exists(rnd_file_path):
+                os.unlink(rnd_file_path)
+        return
+
+    # ========== Worker mode or serial mode ==========
+    # Load pre-computed rnd values if in worker mode
+    if is_worker and args.rnd_file:
+        with open(args.rnd_file, 'r') as f:
+            all_rnd_values = json.load(f)
+        log(f"Worker shard {args.shard}/{args.num_shards} on GPU {args.gpu_id}")
+    else:
+        # Serial mode: compute rnd values on-the-fly (same as original behavior)
+        all_rnd_values = precompute_rnd_values(len(tasks), args.seed, args.views)
+
+    # Determine which tasks to process
+    if is_worker:
+        # Shard the tasks: each worker handles tasks[shard::num_shards]
+        task_indices = list(range(args.shard, len(tasks), args.num_shards))
+    else:
+        task_indices = list(range(len(tasks)))
+
     success = 0
-    for idx, row in enumerate(tasks):
+    for i, idx in enumerate(task_indices):
+        row = tasks[idx]
+        rnd_value = all_rnd_values[idx]
         oid = row.get("obj_id", f"idx_{idx}")
         mode_label = "unlit-only" if args.unlit_only else "lit+unlit"
-        log(f"[{idx + 1}/{len(tasks)}] Rendering {oid} ({mode_label})")
+        progress = f"[{i + 1}/{len(task_indices)}]" if is_worker else f"[{idx + 1}/{len(tasks)}]"
+        log(f"{progress} Rendering {oid} ({mode_label})")
         try:
-            ok = render_object(row, args, rng)
+            ok = render_object(row, args, rnd_value)
             success += int(ok)
         except Exception as e:
             log(f"{oid}: render failed with error {e}")
         finally:
             clear_data_blocks()
 
-    log(f"Completed. Success: {success}/{len(tasks)}")
+    log(f"Completed. Success: {success}/{len(task_indices)}")
 
 
 if __name__ == "__main__":
