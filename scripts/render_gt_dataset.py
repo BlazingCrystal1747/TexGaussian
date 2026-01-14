@@ -4,7 +4,7 @@
 render_gt_dataset.py
 
 Purpose:
-    - Always renders both unlit channels (albedo/rough/metal/normal) and lit PBR previews per object.
+    - Renders unlit channels (albedo/rough/metal/normal/depth) and optionally lit PBR previews per object.
 
 Output layout:
     {out_root}/{obj_id}/lit/   -> 000_beauty.png (single HDRI)
@@ -607,27 +607,32 @@ def render_object(row: Dict[str, str], args: argparse.Namespace, rng: random.Ran
     unlit_dir = os.path.join(obj_root, "unlit")
     os.makedirs(unlit_dir, exist_ok=True)
 
+    unlit_done = os.path.join(unlit_dir, f"{args.views - 1:03d}_normal.png")
+    if args.unlit_only and os.path.exists(unlit_done):
+        log(f"{oid}: found existing unlit renders, skip.")
+        return True
+
     lit_configs: List[Dict[str, str]] = []
     lit_configs_to_render: List[Dict[str, str]] = []
-    for entry in args.hdris:
-        subdir = "lit" if not args.multi_hdri else os.path.join("lit", entry["name"])
-        lit_dir = os.path.join(obj_root, subdir)
-        os.makedirs(lit_dir, exist_ok=True)
-        config = {
-            "path": entry["path"],
-            "name": entry["name"],
-            "subdir": subdir,
-            "dir": lit_dir,
-        }
-        lit_configs.append(config)
-        done_path = os.path.join(lit_dir, f"{args.views - 1:03d}_beauty.png")
-        if not os.path.exists(done_path):
-            lit_configs_to_render.append(config)
+    if not args.unlit_only:
+        for entry in args.hdris:
+            subdir = "lit" if not args.multi_hdri else os.path.join("lit", entry["name"])
+            lit_dir = os.path.join(obj_root, subdir)
+            os.makedirs(lit_dir, exist_ok=True)
+            config = {
+                "path": entry["path"],
+                "name": entry["name"],
+                "subdir": subdir,
+                "dir": lit_dir,
+            }
+            lit_configs.append(config)
+            done_path = os.path.join(lit_dir, f"{args.views - 1:03d}_beauty.png")
+            if not os.path.exists(done_path):
+                lit_configs_to_render.append(config)
 
-    unlit_done = os.path.join(unlit_dir, f"{args.views - 1:03d}_normal.png")
-    if not lit_configs_to_render and os.path.exists(unlit_done):
-        log(f"{oid}: found existing renders, skip.")
-        return True
+        if not lit_configs_to_render and os.path.exists(unlit_done):
+            log(f"{oid}: found existing renders, skip.")
+            return True
 
     scene = reset_scene(args.resolution, samples=args.samples)
     mesh_obj = import_and_normalize(mesh_path)
@@ -681,7 +686,7 @@ def render_object(row: Dict[str, str], args: argparse.Namespace, rng: random.Ran
         )
 
     # Lit pass (PBR)
-    if lit_configs_to_render:
+    if not args.unlit_only and lit_configs_to_render:
         scene.cycles.samples = args.samples
         mesh_obj.data.materials.clear()
         mesh_obj.data.materials.append(pbr_mat)
@@ -712,17 +717,20 @@ def render_object(row: Dict[str, str], args: argparse.Namespace, rng: random.Ran
                 with suppress_render_output():
                     bpy.ops.render.render(write_still=True)
 
-    lit_meta = {
-        "hdris": [
-            {"path": cfg["path"], "name": cfg["name"], "subdir": cfg["subdir"]}
-            for cfg in lit_configs
-        ],
-        "hdri_strength": args.hdri_strength,
-        "samples": args.samples,
-        "background": args.background,
-    }
-    if len(lit_configs) == 1:
-        lit_meta["hdri"] = lit_configs[0]["path"]
+    if args.unlit_only:
+        lit_meta = {"enabled": False}
+    else:
+        lit_meta = {
+            "hdris": [
+                {"path": cfg["path"], "name": cfg["name"], "subdir": cfg["subdir"]}
+                for cfg in lit_configs
+            ],
+            "hdri_strength": args.hdri_strength,
+            "samples": args.samples,
+            "background": args.background,
+        }
+        if len(lit_configs) == 1:
+            lit_meta["hdri"] = lit_configs[0]["path"]
 
     meta = {
         "obj_id": oid,
@@ -789,6 +797,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--background", choices=["black", "white", "hdri", "transparent"], default=None, help="Background mode for lit renders (default: hdri).")
     parser.add_argument("--save-blend", action="store_true", help="Save a .blend file per object for inspection.")
+    parser.add_argument("--unlit-only", action="store_true", help="Render unlit channels only (skip lit PBR).")
     return parser.parse_args(argv)
 
 
@@ -809,14 +818,17 @@ def main(argv: List[str]) -> None:
         return
 
     args.hdris = build_hdri_entries(args.hdri)
-    if not args.hdris:
-        log("Lit renders require at least one valid --hdri path.")
-        return
-    missing_hdris = [entry["path"] for entry in args.hdris if not os.path.exists(entry["path"])]
-    if missing_hdris:
-        log(f"Lit renders missing HDRI files: {', '.join(missing_hdris)}")
-        return
-    args.multi_hdri = len(args.hdris) > 1
+    if not args.unlit_only:
+        if not args.hdris:
+            log("Lit renders require at least one valid --hdri path.")
+            return
+        missing_hdris = [entry["path"] for entry in args.hdris if not os.path.exists(entry["path"])]
+        if missing_hdris:
+            log(f"Lit renders missing HDRI files: {', '.join(missing_hdris)}")
+            return
+        args.multi_hdri = len(args.hdris) > 1
+    else:
+        args.multi_hdri = False
 
     os.makedirs(args.out_root, exist_ok=True)
     rng = random.Random(args.seed)
@@ -839,7 +851,8 @@ def main(argv: List[str]) -> None:
     success = 0
     for idx, row in enumerate(tasks):
         oid = row.get("obj_id", f"idx_{idx}")
-        log(f"[{idx + 1}/{len(tasks)}] Rendering {oid} (lit+unlit)")
+        mode_label = "unlit-only" if args.unlit_only else "lit+unlit"
+        log(f"[{idx + 1}/{len(tasks)}] Rendering {oid} ({mode_label})")
         try:
             ok = render_object(row, args, rng)
             success += int(ok)
