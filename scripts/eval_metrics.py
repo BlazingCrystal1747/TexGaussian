@@ -231,8 +231,8 @@ def collect_lit_paths(
     for obj_id in obj_ids:
         gt_dir = os.path.join(base_gt_dir, obj_id, lit_subdir)
         gen_dir = os.path.join(base_gen_dir, obj_id, lit_subdir)
-        gt_paths = sorted(glob.glob(os.path.join(gt_dir, "*_beauty.png")))
-        gen_paths = sorted(glob.glob(os.path.join(gen_dir, "*_beauty.png")))
+        gt_paths = sorted(glob.glob(os.path.join(gt_dir, "*_lit.png")))
+        gen_paths = sorted(glob.glob(os.path.join(gen_dir, "*_lit.png")))
 
         if not gen_paths:
             raise FileNotFoundError(f"No generated lit images found for {obj_id} in {gen_dir}")
@@ -1189,10 +1189,10 @@ def compute_multiview_consistency_metrics(
                         gen_dir = os.path.join(gen_dir, subdirs[0])
                         gt_dir = os.path.join(gt_dir, subdirs[0])
                 
-                gen_path1 = os.path.join(gen_dir, f"{prefix1}_beauty.png")
-                gen_path2 = os.path.join(gen_dir, f"{prefix2}_beauty.png")
-                gt_path1 = os.path.join(gt_dir, f"{prefix1}_beauty.png")
-                gt_path2 = os.path.join(gt_dir, f"{prefix2}_beauty.png")
+                gen_path1 = os.path.join(gen_dir, f"{prefix1}_lit.png")
+                gen_path2 = os.path.join(gen_dir, f"{prefix2}_lit.png")
+                gt_path1 = os.path.join(gt_dir, f"{prefix1}_lit.png")
+                gt_path2 = os.path.join(gt_dir, f"{prefix2}_lit.png")
             else:
                 # albedo or normal
                 suffix = channel

@@ -478,8 +478,8 @@ def frame_basename(frame: Dict[str, Any], idx: int) -> str:
         return str(frame["file_prefix"])
     if frame.get("file_name"):
         base = os.path.splitext(os.path.basename(frame["file_name"]))[0]
-        if base.endswith("_beauty"):
-            return base[:-7]
+        if base.endswith("_lit"):
+            return base[:-4]
         return base
     return f"{idx:03d}"
 
@@ -562,7 +562,7 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
         return False
 
     _, last_frame, _, last_base = frame_data[-1]
-    lit_name = last_frame.get("file_name") or f"{last_base}_beauty.png"
+    lit_name = last_frame.get("file_name") or f"{last_base}_lit.png"
     images = last_frame.get("images") or {}
     unlit_names = {
         name: images.get(name) or f"{last_base}_{name}.png" for name, _ in PASS_CONFIG
@@ -612,7 +612,7 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
     if not normal_path:
         log(f"{oid}: normal map missing, using geometry normals for lit and unlit.")
 
-    mat_beauty = build_pbr_material(albedo, rough, metal, normal_path)
+    mat_lit = build_pbr_material(albedo, rough, metal, normal_path)
     emission_mats: Dict[str, bpy.types.Material] = {}
     for name, cs in PASS_CONFIG:
         if name == "normal":
@@ -649,7 +649,7 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
     if lit_configs_to_render:
         scene.cycles.samples = args.samples
         mesh_obj.data.materials.clear()
-        mesh_obj.data.materials.append(mat_beauty)
+        mesh_obj.data.materials.append(mat_lit)
         for lit_cfg in lit_configs_to_render:
             try:
                 setup_background(scene, args.background, lit_cfg["path"], args.hdri_strength)
@@ -659,7 +659,7 @@ def render_object(row: Dict[str, str], args: argparse.Namespace) -> bool:
             for idx, frame, w2c, base in frame_data:
                 if not apply_camera(w2c, idx):
                     continue
-                out_name = frame.get("file_name") or f"{base}_beauty.png"
+                out_name = frame.get("file_name") or f"{base}_lit.png"
                 scene.render.filepath = os.path.join(lit_cfg["dir"], out_name)
                 with suppress_render_output():
                     bpy.ops.render.render(write_still=True)
