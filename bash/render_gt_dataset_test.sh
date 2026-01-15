@@ -19,7 +19,11 @@ conda activate blender
 MANIFEST_PATH="../experiments/common_splits/test.tsv"
 
 # 输出: 数据集根目录 (脚本会自动创建 {obj_id}/lit 与 {obj_id}/unlit)
-OUT_ROOT="../datasets/texverse_rendered/test"
+OUT_ROOT="../datasets/texverse_rendered_test"
+
+# 并行配置: GPU 数量
+NUM_GPUS=2
+GPU_LIST=$(seq -s, 0 $((NUM_GPUS - 1)))
 
 # 资源: HDRI 环境贴图 (lit 渲染必需，可配置多个)
 # 使用你参考脚本中的路径
@@ -39,21 +43,24 @@ echo "Start Rendering GT (Lit+Unlit)"
 echo "Manifest: $MANIFEST_PATH"
 echo "Output:   $OUT_ROOT/{obj_id}/(lit|unlit)"
 echo "HDRIs:    ${HDRI_PATHS[*]}"
+echo "Workers:  $NUM_GPUS (GPUs: $GPU_LIST)"
 echo "=========================================="
 
 # 3. 执行 Python 渲染命令
 # 注意：这里使用的是新脚本 render_gt_dataset.py 的参数命名
-CUDA_VISIBLE_DEVICES=0 python ./scripts/render_gt_dataset.py \
+python ./scripts/render_gt_dataset.py \
   --manifest "$MANIFEST_PATH" \
   --out-root "$OUT_ROOT" \
   "${HDRI_ARGS[@]}" \
-  --resolution 512 \
-  --views 20 \
+  --resolution 1024 \
+  --views 16 \
   --samples 64 \
   --hdri-strength 1.0 \
   --seed 42 \
   --save-blend \
-  --background transparent
+  --background transparent \
+  --workers "$NUM_GPUS" \
+  --gpu-list "$GPU_LIST"
 
 echo "Done."
 

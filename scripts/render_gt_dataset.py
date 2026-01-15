@@ -7,8 +7,8 @@ Purpose:
     - Renders unlit channels (albedo/rough/metal/normal/depth) and optionally lit PBR previews per object.
 
 Output layout:
-    {out_root}/{obj_id}/lit/   -> 000_beauty.png (single HDRI)
-    {out_root}/{obj_id}/lit/{hdri_name}/ -> 000_beauty.png (multi-HDRI)
+    {out_root}/{obj_id}/lit/   -> 000_lit.png (single HDRI)
+    {out_root}/{obj_id}/lit/{hdri_name}/ -> 000_lit.png (multi-HDRI)
     {out_root}/{obj_id}/unlit/ -> 000_albedo.png, 000_rough.png, 000_metal.png, 000_normal.png
     {out_root}/{obj_id}/transforms.json
 """
@@ -627,32 +627,35 @@ def render_object(row: Dict[str, str], args: argparse.Namespace, rnd_value: floa
     unlit_dir = os.path.join(obj_root, "unlit")
     os.makedirs(unlit_dir, exist_ok=True)
 
-    unlit_done = os.path.join(unlit_dir, f"{args.views - 1:03d}_normal.png")
-    if args.unlit_only and os.path.exists(unlit_done):
-        log(f"{oid}: found existing unlit renders, skip.")
-        return True
-
+    # Build lit configs first (needed for completeness check)
     lit_configs: List[Dict[str, str]] = []
-    lit_configs_to_render: List[Dict[str, str]] = []
     if not args.unlit_only:
         for entry in args.hdris:
             subdir = "lit" if not args.multi_hdri else os.path.join("lit", entry["name"])
             lit_dir = os.path.join(obj_root, subdir)
             os.makedirs(lit_dir, exist_ok=True)
-            config = {
+            lit_configs.append({
                 "path": entry["path"],
                 "name": entry["name"],
                 "subdir": subdir,
                 "dir": lit_dir,
-            }
-            lit_configs.append(config)
-            done_path = os.path.join(lit_dir, f"{args.views - 1:03d}_beauty.png")
-            if not os.path.exists(done_path):
-                lit_configs_to_render.append(config)
+            })
 
-        if not lit_configs_to_render and os.path.exists(unlit_done):
-            log(f"{oid}: found existing renders, skip.")
-            return True
+    # Check if object is completely rendered (object-level checkpoint)
+    # depth is the last pass in PASS_CONFIG_UNLIT
+    unlit_done = os.path.join(unlit_dir, f"{args.views - 1:03d}_depth.png")
+    object_complete = os.path.exists(unlit_done)
+    if object_complete and not args.unlit_only:
+        # Also check all lit HDRIs are complete
+        for lit_cfg in lit_configs:
+            lit_done = os.path.join(lit_cfg["dir"], f"{args.views - 1:03d}_lit.png")
+            if not os.path.exists(lit_done):
+                object_complete = False
+                break
+
+    if object_complete:
+        log(f"{oid}: found existing complete renders, skip.")
+        return True
 
     scene = reset_scene(args.resolution, samples=args.samples)
     mesh_obj = import_and_normalize(mesh_path)
@@ -693,7 +696,7 @@ def render_object(row: Dict[str, str], args: argparse.Namespace, rnd_value: floa
             {
                 "frame_id": idx,
                 "file_prefix": frame_prefix,
-                "file_name": f"{frame_prefix}_beauty.png",
+                "file_name": f"{frame_prefix}_lit.png",
                 "images": {
                     "albedo": f"{frame_prefix}_albedo.png",
                     "rough": f"{frame_prefix}_rough.png",
@@ -705,37 +708,36 @@ def render_object(row: Dict[str, str], args: argparse.Namespace, rnd_value: floa
             }
         )
 
-    # Lit pass (PBR)
-    if not args.unlit_only and lit_configs_to_render:
+    # Lit pass (PBR) - render all HDRIs
+    if not args.unlit_only and lit_configs:
         scene.cycles.samples = args.samples
         mesh_obj.data.materials.clear()
         mesh_obj.data.materials.append(pbr_mat)
-        for lit_cfg in lit_configs_to_render:
+        for lit_cfg in lit_configs:
             setup_background(scene, args.background, lit_cfg["path"], args.hdri_strength)
             for view in frame_views:
                 cam.location = view["pos"]
                 look_at_origin(cam, zero)
                 bpy.context.view_layer.update()
-                scene.render.filepath = os.path.join(lit_cfg["dir"], f"{view['prefix']}_beauty.png")
+                scene.render.filepath = os.path.join(lit_cfg["dir"], f"{view['prefix']}_lit.png")
                 with suppress_render_output():
                     bpy.ops.render.render(write_still=True)
 
     # Unlit pass (emission, 1 sample)
-    if not os.path.exists(unlit_done):
-        scene.cycles.samples = 1
-        setup_background(scene, "transparent", "", 0.0)
-        for view in frame_views:
-            cam.location = view["pos"]
-            look_at_origin(cam, zero)
-            bpy.context.view_layer.update()
+    scene.cycles.samples = 1
+    setup_background(scene, "transparent", "", 0.0)
+    for view in frame_views:
+        cam.location = view["pos"]
+        look_at_origin(cam, zero)
+        bpy.context.view_layer.update()
 
-            frame_prefix = view["prefix"]
-            for pass_name, _ in PASS_CONFIG_UNLIT:
-                mesh_obj.data.materials.clear()
-                mesh_obj.data.materials.append(unlit_mats[pass_name])
-                scene.render.filepath = os.path.join(unlit_dir, f"{frame_prefix}_{pass_name}.png")
-                with suppress_render_output():
-                    bpy.ops.render.render(write_still=True)
+        frame_prefix = view["prefix"]
+        for pass_name, _ in PASS_CONFIG_UNLIT:
+            mesh_obj.data.materials.clear()
+            mesh_obj.data.materials.append(unlit_mats[pass_name])
+            scene.render.filepath = os.path.join(unlit_dir, f"{frame_prefix}_{pass_name}.png")
+            with suppress_render_output():
+                bpy.ops.render.render(write_still=True)
 
     if args.unlit_only:
         lit_meta = {"enabled": False}
