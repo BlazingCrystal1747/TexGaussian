@@ -2,6 +2,8 @@ import os
 import sys
 import csv
 import json
+import subprocess
+import copy
 from dataclasses import asdict, is_dataclass
 import tyro
 import tqdm
@@ -670,8 +672,383 @@ def write_result_manifest(tsv_path: str, rows):
     print(f"[INFO] Saved generated manifest to {tsv_path}")
 
 
-if __name__ == "__main__":
+def parse_gpu_ids(gpu_ids_str: str):
+    """Parse GPU IDs from comma-separated string."""
+    gpu_ids_str = gpu_ids_str.strip()
+    # Handle both formats: "0,1,2" and "[0,1,2]"
+    if gpu_ids_str.startswith('[') and gpu_ids_str.endswith(']'):
+        gpu_ids_str = gpu_ids_str[1:-1]
+    return [int(x.strip()) for x in gpu_ids_str.split(',') if x.strip()]
 
+
+def estimate_workers_per_gpu(gpu_id: int, model_memory_gb: float = 6.0, safety_margin: float = 0.85):
+    """Estimate optimal number of workers per GPU based on available memory.
+    
+    Args:
+        gpu_id: GPU device ID to query
+        model_memory_gb: Estimated memory per worker in GB (model + data)
+        safety_margin: Fraction of GPU memory to use (0.85 = 85%)
+    
+    Returns:
+        Recommended number of workers for this GPU
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return 1
+        
+        # Query GPU memory
+        total_memory = torch.cuda.get_device_properties(gpu_id).total_memory
+        total_memory_gb = total_memory / (1024 ** 3)
+        
+        # Calculate available memory with safety margin
+        available_gb = total_memory_gb * safety_margin
+        
+        # Estimate workers (at least 1, at most 4 to avoid diminishing returns)
+        estimated = int(available_gb / model_memory_gb)
+        workers = max(1, min(estimated, 4))
+        
+        return workers, total_memory_gb
+    except Exception as e:
+        print(f"[WARN] Failed to query GPU {gpu_id} memory: {e}")
+        return 1, 0
+
+
+def calculate_workers_per_gpu(gpu_ids: list, workers_per_gpu_str: str):
+    """Calculate workers per GPU from string config.
+    
+    Args:
+        gpu_ids: List of GPU IDs to use
+        workers_per_gpu_str: Either 'auto' or a number string
+    
+    Returns:
+        Integer number of workers per GPU
+    """
+    workers_per_gpu_str = str(workers_per_gpu_str).strip().lower()
+    
+    if workers_per_gpu_str == 'auto':
+        # Auto-detect based on GPU memory
+        if not gpu_ids:
+            return 1
+        
+        # Query first GPU to estimate (assume all GPUs are similar)
+        try:
+            import torch
+            # Temporarily set visible device to query
+            first_gpu = gpu_ids[0]
+            workers, total_mem = estimate_workers_per_gpu(first_gpu)
+            print(f"[INFO] Auto-detected GPU memory: {total_mem:.1f} GB")
+            print(f"[INFO] Auto-calculated workers_per_gpu: {workers}")
+            return workers
+        except Exception as e:
+            print(f"[WARN] Auto-detection failed, using default: {e}")
+            return 2  # Safe default
+    else:
+        # Manual specification
+        try:
+            return max(1, int(workers_per_gpu_str))
+        except ValueError:
+            print(f"[WARN] Invalid workers_per_gpu '{workers_per_gpu_str}', using default 1")
+            return 1
+
+
+def run_single_gpu_worker(gpu_id: int, worker_id: int, rows_subset: list, opt, tsv_dir: str, textures_dir: str):
+    """Run inference on a single GPU for a subset of samples.
+    
+    This function should be called after CUDA_VISIBLE_DEVICES is set.
+    
+    Args:
+        gpu_id: Physical GPU ID
+        worker_id: Local worker ID on this GPU (0, 1, 2, ...)
+        rows_subset: List of (global_idx, row) tuples to process
+        opt: Options object
+        tsv_dir: Directory containing the TSV file
+        textures_dir: Output directory for textures
+    """
+    import torch
+    
+    worker_tag = f"[GPU {gpu_id} W{worker_id}]"
+    
+    # Verify we're on the correct GPU
+    if torch.cuda.is_available():
+        print(f"{worker_tag} CUDA available, device count: {torch.cuda.device_count()}")
+        print(f"{worker_tag} Current device: {torch.cuda.current_device()}")
+        print(f"{worker_tag} Device name: {torch.cuda.get_device_name(0)}")
+    
+    # Create converter for this GPU
+    converter = Converter(opt).cuda()
+    converter.load_ckpt(opt.ckpt_path)
+    
+    processed_samples = []
+    skipped_samples = []
+    
+    for local_idx, (global_idx, row) in enumerate(rows_subset):
+        mesh_path = (row.get("mesh") or "").strip()
+        caption_short = (row.get("caption_short") or "").strip()
+        caption_long = (row.get("caption_long") or "").strip()
+        caption = (row.get(opt.caption_field) or "").strip()
+        obj_id = (row.get("obj_id") or "").strip() or f"sample_{global_idx}"
+
+        if not mesh_path or not caption:
+            print(f"{worker_tag} Skip row {global_idx}: missing mesh or caption (obj_id={obj_id})")
+            skipped_samples.append({"obj_id": obj_id, "reason": "missing mesh or caption"})
+            continue
+
+        if not os.path.isabs(mesh_path):
+            mesh_path = os.path.join(tsv_dir, mesh_path)
+
+        converter.opt.texture_name = obj_id
+        converter.opt.mesh_path = mesh_path
+        converter.set_text_prompt(caption)
+
+        sample_output_dir = os.path.join(textures_dir, converter.opt.texture_name)
+        os.makedirs(sample_output_dir, exist_ok=True)
+
+        print(f"{worker_tag} Processing {converter.opt.texture_name} ({local_idx + 1}/{len(rows_subset)}, global {global_idx + 1})")
+        try:
+            converter.load_mesh(mesh_path)
+            converter.fit_mesh_uv(iters=1000)
+            converter.export_mesh(sample_output_dir)
+
+            processed_samples.append(build_result_row(
+                converter.opt.texture_name,
+                sample_output_dir,
+                caption_short=caption_short,
+                caption_long=caption_long,
+                caption_used=opt.caption_field,
+            ))
+        except Exception as e:
+            print(f"{worker_tag} Error processing {obj_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            skipped_samples.append({"obj_id": obj_id, "reason": str(e)})
+    
+    return processed_samples, skipped_samples
+
+
+def worker_subprocess_entry():
+    """Entry point for worker subprocess.
+    
+    This is called by subprocess with specific environment variables set.
+    """
+    import os
+    import sys
+    import json
+    import pickle
+    
+    # Read configuration from environment
+    gpu_id = int(os.environ['TEXGAUSSIAN_GPU_ID'])
+    worker_id = int(os.environ.get('TEXGAUSSIAN_WORKER_ID', '0'))
+    config_file = os.environ['TEXGAUSSIAN_CONFIG_FILE']
+    
+    worker_tag = f"[GPU {gpu_id} W{worker_id}]"
+    print(f"{worker_tag} Starting subprocess...")
+    print(f"{worker_tag} CUDA_VISIBLE_DEVICES = {os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
+    
+    # Load configuration
+    with open(config_file, 'rb') as f:
+        config = pickle.load(f)
+    
+    opt_dict = config['opt_dict']
+    rows_subset = config['rows_subset']
+    tsv_dir = config['tsv_dir']
+    textures_dir = config['textures_dir']
+    result_file = config['result_file']
+    
+    # Reconstruct options
+    from core.options import Options
+    opt = Options(**opt_dict)
+    
+    # Run the actual processing
+    processed_samples, skipped_samples = run_single_gpu_worker(
+        gpu_id, worker_id, rows_subset, opt, tsv_dir, textures_dir
+    )
+    
+    # Save results
+    results = {
+        "gpu_id": gpu_id,
+        "worker_id": worker_id,
+        "processed": processed_samples,
+        "skipped": skipped_samples
+    }
+    with open(result_file, 'wb') as f:
+        pickle.dump(results, f)
+    
+    print(f"{worker_tag} Finished. Processed {len(processed_samples)}, skipped {len(skipped_samples)}")
+
+
+def run_single_gpu(opt, converter, batch_rows, tsv_dir, textures_dir):
+    """Run inference on a single GPU (original behavior)."""
+    processed_samples = []
+    skipped_samples = []
+
+    for idx, row in enumerate(batch_rows):
+        mesh_path = (row.get("mesh") or "").strip()
+        caption_short = (row.get("caption_short") or "").strip()
+        caption_long = (row.get("caption_long") or "").strip()
+        caption = (row.get(opt.caption_field) or "").strip()
+        obj_id = (row.get("obj_id") or "").strip() or f"sample_{idx}"
+
+        if not mesh_path or not caption:
+            print(f"[WARN] Skip row {idx}: missing mesh or caption (obj_id={obj_id})")
+            skipped_samples.append({"obj_id": obj_id, "reason": "missing mesh or caption"})
+            continue
+
+        if not os.path.isabs(mesh_path):
+            mesh_path = os.path.join(tsv_dir, mesh_path)
+
+        converter.opt.texture_name = obj_id
+        converter.opt.mesh_path = mesh_path
+        converter.set_text_prompt(caption)
+
+        sample_output_dir = os.path.join(textures_dir, converter.opt.texture_name)
+        os.makedirs(sample_output_dir, exist_ok=True)
+
+        print(f"[INFO] Processing {converter.opt.texture_name} ({idx + 1}/{len(batch_rows)})")
+        converter.load_mesh(mesh_path)
+        converter.fit_mesh_uv(iters=1000)
+        converter.export_mesh(sample_output_dir)
+
+        processed_samples.append(build_result_row(
+            converter.opt.texture_name,
+            sample_output_dir,
+            caption_short=caption_short,
+            caption_long=caption_long,
+            caption_used=opt.caption_field,
+        ))
+    
+    return processed_samples, skipped_samples
+
+
+def run_multi_gpu(opt, batch_rows, tsv_dir, textures_dir, gpu_ids, workers_per_gpu=1):
+    """Run inference on multiple GPUs in parallel using subprocesses.
+    
+    Each GPU can run multiple worker processes to maximize GPU utilization.
+    This ensures results are identical to single-GPU mode.
+    
+    Args:
+        opt: Options object
+        batch_rows: List of sample rows to process
+        tsv_dir: Directory containing the TSV file
+        textures_dir: Output directory for textures
+        gpu_ids: List of GPU IDs to use
+        workers_per_gpu: Number of parallel workers per GPU
+    """
+    import subprocess
+    import pickle
+    import tempfile
+    
+    num_gpus = len(gpu_ids)
+    num_samples = len(batch_rows)
+    total_workers = num_gpus * workers_per_gpu
+    
+    # Distribute samples across all workers (round-robin)
+    # Each worker is identified by (gpu_id, local_worker_id)
+    worker_assignments = [[] for _ in range(total_workers)]
+    for idx, row in enumerate(batch_rows):
+        worker_idx = idx % total_workers
+        worker_assignments[worker_idx].append((idx, row))
+    
+    print(f"[INFO] Distributing {num_samples} samples across {num_gpus} GPUs x {workers_per_gpu} workers = {total_workers} total workers")
+    
+    # Show distribution per GPU
+    for gpu_idx, gpu_id in enumerate(gpu_ids):
+        gpu_total = sum(len(worker_assignments[gpu_idx * workers_per_gpu + w]) for w in range(workers_per_gpu))
+        print(f"  GPU {gpu_id}: {gpu_total} samples ({workers_per_gpu} workers)")
+    
+    # Convert options to dict for pickling
+    opt_dict = asdict(opt)
+    
+    # Create temporary directory for config and result files
+    temp_dir = tempfile.mkdtemp(prefix="texgaussian_multiGPU_")
+    print(f"[INFO] Using temp directory: {temp_dir}")
+    
+    # Start subprocesses
+    processes = []
+    result_files = []
+    
+    for gpu_idx, gpu_id in enumerate(gpu_ids):
+        for local_worker_id in range(workers_per_gpu):
+            global_worker_id = gpu_idx * workers_per_gpu + local_worker_id
+            rows_subset = worker_assignments[global_worker_id]
+            
+            if not rows_subset:
+                continue
+            
+            # Create config file for this worker
+            config_file = os.path.join(temp_dir, f"config_gpu{gpu_id}_worker{local_worker_id}.pkl")
+            result_file = os.path.join(temp_dir, f"result_gpu{gpu_id}_worker{local_worker_id}.pkl")
+            result_files.append((gpu_id, local_worker_id, result_file))
+            
+            config = {
+                'opt_dict': opt_dict,
+                'rows_subset': rows_subset,
+                'tsv_dir': tsv_dir,
+                'textures_dir': textures_dir,
+                'result_file': result_file,
+            }
+            with open(config_file, 'wb') as f:
+                pickle.dump(config, f)
+            
+            # Set up environment for subprocess
+            env = os.environ.copy()
+            env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+            env['TEXGAUSSIAN_GPU_ID'] = str(gpu_id)
+            env['TEXGAUSSIAN_WORKER_ID'] = str(local_worker_id)
+            env['TEXGAUSSIAN_CONFIG_FILE'] = config_file
+            
+            # Launch subprocess
+            cmd = [
+                sys.executable,
+                '-c',
+                'from texture import worker_subprocess_entry; worker_subprocess_entry()'
+            ]
+            
+            print(f"[INFO] Launching subprocess for GPU {gpu_id} Worker {local_worker_id} ({len(rows_subset)} samples)...")
+            p = subprocess.Popen(
+                cmd,
+                env=env,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                stdout=None,  # Inherit stdout
+                stderr=None,  # Inherit stderr
+            )
+            processes.append((gpu_id, local_worker_id, p))
+    
+    # Wait for all subprocesses to complete
+    print(f"[INFO] Waiting for {len(processes)} subprocesses to complete...")
+    for gpu_id, local_worker_id, p in processes:
+        return_code = p.wait()
+        if return_code != 0:
+            print(f"[WARN] Subprocess for GPU {gpu_id} Worker {local_worker_id} exited with code {return_code}")
+    
+    # Collect results from all workers
+    all_processed = []
+    all_skipped = []
+    
+    for gpu_id, local_worker_id, result_file in result_files:
+        if os.path.exists(result_file):
+            with open(result_file, 'rb') as f:
+                results = pickle.load(f)
+            all_processed.extend(results["processed"])
+            all_skipped.extend(results["skipped"])
+            print(f"[INFO] Collected results from GPU {gpu_id} Worker {local_worker_id}: {len(results['processed'])} processed, {len(results['skipped'])} skipped")
+        else:
+            print(f"[WARN] Result file not found for GPU {gpu_id} Worker {local_worker_id}: {result_file}")
+    
+    # Clean up temp files
+    import shutil
+    try:
+        shutil.rmtree(temp_dir)
+    except Exception as e:
+        print(f"[WARN] Failed to clean up temp directory: {e}")
+    
+    # Sort results by obj_id to maintain consistent ordering
+    all_processed.sort(key=lambda x: x["obj_id"])
+    all_skipped.sort(key=lambda x: x["obj_id"])
+    
+    return all_processed, all_skipped
+
+if __name__ == "__main__":
     opt = tyro.cli(AllConfigs)
 
     opt.use_checkpoint = str2bool(opt.use_checkpoint)
@@ -698,8 +1075,16 @@ if __name__ == "__main__":
     result_tsv_path = os.path.abspath(result_tsv_path)
     opt.result_tsv = result_tsv_path
 
-    converter = Converter(opt).cuda()
-    converter.load_ckpt(opt.ckpt_path)
+    # Parse GPU IDs
+    gpu_ids = parse_gpu_ids(opt.gpu_ids)
+    num_gpus = min(opt.num_gpus, len(gpu_ids)) if opt.num_gpus > 0 else len(gpu_ids)
+    gpu_ids = gpu_ids[:num_gpus]
+    
+    # Calculate workers per GPU (auto or manual)
+    workers_per_gpu = calculate_workers_per_gpu(gpu_ids, opt.workers_per_gpu)
+    
+    print(f"[INFO] Using {len(gpu_ids)} GPU(s): {gpu_ids}")
+    print(f"[INFO] Workers per GPU: {workers_per_gpu}")
 
     if opt.tsv_path:
         tsv_dir = os.path.dirname(os.path.abspath(opt.tsv_path))
@@ -716,57 +1101,37 @@ if __name__ == "__main__":
         print(f"[INFO] Using caption field: {opt.caption_field}")
         os.makedirs(textures_dir, exist_ok=True)
 
-        processed_samples = []
-        skipped_samples = []
-
-        for idx, row in enumerate(batch_rows):
-            mesh_path = (row.get("mesh") or "").strip()
-            caption_short = (row.get("caption_short") or "").strip()
-            caption_long = (row.get("caption_long") or "").strip()
-            caption = (row.get(opt.caption_field) or "").strip()
-            obj_id = (row.get("obj_id") or "").strip() or f"sample_{idx}"
-
-            if not mesh_path or not caption:
-                print(f"[WARN] Skip row {idx}: missing mesh or caption (obj_id={obj_id})")
-                skipped_samples.append({"obj_id": obj_id, "reason": "missing mesh or caption"})
-                continue
-
-            if not os.path.isabs(mesh_path):
-                mesh_path = os.path.join(tsv_dir, mesh_path)
-
-            converter.opt.texture_name = obj_id
-            converter.opt.mesh_path = mesh_path
-            converter.set_text_prompt(caption)
-
-            sample_output_dir = os.path.join(textures_dir, converter.opt.texture_name)
-            os.makedirs(sample_output_dir, exist_ok=True)
-
-            print(f"[INFO] Processing {converter.opt.texture_name} ({idx + 1}/{len(batch_rows)})")
-            converter.load_mesh(mesh_path)
-            converter.fit_mesh_uv(iters = 1000)
-            converter.export_mesh(sample_output_dir)
-
-            processed_samples.append(build_result_row(
-                converter.opt.texture_name,
-                sample_output_dir,
-                caption_short=caption_short,
-                caption_long=caption_long,
-                caption_used=opt.caption_field,
-            ))
+        total_workers = len(gpu_ids) * workers_per_gpu
+        if total_workers > 1 and len(batch_rows) > 1:
+            # Multi-worker mode (multiple GPUs and/or multiple workers per GPU)
+            print(f"[INFO] Running in parallel mode: {len(gpu_ids)} GPUs x {workers_per_gpu} workers = {total_workers} total workers")
+            processed_samples, skipped_samples = run_multi_gpu(
+                opt, batch_rows, tsv_dir, textures_dir, gpu_ids, workers_per_gpu
+            )
+        else:
+            # Single-GPU single-worker mode
+            print(f"[INFO] Running in single-GPU mode")
+            converter = Converter(opt).cuda()
+            converter.load_ckpt(opt.ckpt_path)
+            processed_samples, skipped_samples = run_single_gpu(
+                opt, converter, batch_rows, tsv_dir, textures_dir
+            )
 
         if processed_samples:
             write_result_manifest(result_tsv_path, processed_samples)
         save_experiment_config(output_dir, opt, processed_samples, skipped_samples, manifest_path=result_tsv_path if processed_samples else None)
     else:
+        # Single sample mode - always single GPU
+        converter = Converter(opt).cuda()
+        converter.load_ckpt(opt.ckpt_path)
+        
         if opt.use_text and opt.text_prompt:
             converter.set_text_prompt(opt.text_prompt)
         converter.load_mesh(opt.mesh_path)
-        converter.fit_mesh_uv(iters = 1000)
+        converter.fit_mesh_uv(iters=1000)
         sample_output_dir = os.path.join(textures_dir, opt.texture_name)
         converter.export_mesh(sample_output_dir)
 
         processed_samples = [build_result_row(opt.texture_name, sample_output_dir)]
         write_result_manifest(result_tsv_path, processed_samples)
         save_experiment_config(output_dir, opt, processed_samples, manifest_path=result_tsv_path)
-
-    # converter.export_mesh(os.path.join(output_dir, opt.texture_name))

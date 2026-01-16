@@ -74,9 +74,10 @@ class Options:
     texture_cam_radius: float = 4.5
     texture_name: str = 'test'
     save_image: str = 'False'
-    num_gpus: int = 8
-    workers_per_gpu: int = 1
-    gpu_ids: str = '[0,1,2,3,4,5,6,7]'
+    num_gpus: int = 1  # Number of GPUs to use for parallel processing
+    gpu_ids: str = '0'  # Comma-separated GPU IDs (e.g., '0,1,2,3')
+    workers_per_gpu: str = 'auto'  # Workers per GPU: 'auto' or integer (e.g., '2')
+    worker_id: int = -1  # Internal: worker ID for multi-GPU mode (-1 means single GPU mode)
     mesh_path: str = '/workspace/wudang_vuc_3dc_afs/wuchenming/bpfs/pbr_obj_cvpr'
     output_dir: str = 'texture_mesh'
     ckpt_path: str = ''
