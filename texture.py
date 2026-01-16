@@ -704,7 +704,15 @@ if __name__ == "__main__":
     if opt.tsv_path:
         tsv_dir = os.path.dirname(os.path.abspath(opt.tsv_path))
         batch_rows = load_batch_from_tsv(opt.tsv_path, opt.caption_field)
-        print(f"[INFO] Loaded {len(batch_rows)} rows from {opt.tsv_path}")
+        total_rows = len(batch_rows)
+        
+        # Apply max_samples limit if specified
+        if opt.max_samples > 0 and opt.max_samples < total_rows:
+            batch_rows = batch_rows[:opt.max_samples]
+            print(f"[INFO] Loaded {total_rows} rows from {opt.tsv_path}, processing first {opt.max_samples} samples")
+        else:
+            print(f"[INFO] Loaded {total_rows} rows from {opt.tsv_path}")
+        
         print(f"[INFO] Using caption field: {opt.caption_field}")
         os.makedirs(textures_dir, exist_ok=True)
 

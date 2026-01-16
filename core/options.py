@@ -70,6 +70,7 @@ class Options:
     tsv_path: Optional[str] = None
     batch_path: Optional[str] = None
     result_tsv: Optional[str] = None
+    max_samples: int = -1  # Maximum number of samples to process (-1 means all)
     texture_cam_radius: float = 4.5
     texture_name: str = 'test'
     save_image: str = 'False'
