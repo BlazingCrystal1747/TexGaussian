@@ -1,4 +1,5 @@
 import os
+import sys
 import csv
 import json
 from dataclasses import asdict, is_dataclass
@@ -15,6 +16,89 @@ from core.regression_models import TexGaussian
 from core.options import AllConfigs, Options
 from core.gs import GaussianRenderer
 from external.clip import tokenize
+
+# LongCLIP support - lazy import
+_longclip_module = None
+_longclip_tokenize = None
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_LONGCLIP_ROOT = os.path.join(SCRIPT_DIR, "third_party", "Long-CLIP")
+
+
+def resolve_longclip_module(longclip_root=None):
+    """Resolve and import LongCLIP module from third_party or installed package."""
+    global _longclip_module, _longclip_tokenize
+    if _longclip_module is not None:
+        return _longclip_module, _longclip_tokenize
+
+    last_exc = None
+    # Try installed package first
+    try:
+        import longclip as longclip_mod
+        _longclip_module = longclip_mod
+        _longclip_tokenize = longclip_mod.tokenize
+        return _longclip_module, _longclip_tokenize
+    except Exception as exc:
+        last_exc = exc
+
+    # Try third_party paths
+    candidates = []
+    if longclip_root:
+        candidates.append(longclip_root)
+    if os.path.isdir(DEFAULT_LONGCLIP_ROOT) and DEFAULT_LONGCLIP_ROOT not in candidates:
+        candidates.append(DEFAULT_LONGCLIP_ROOT)
+
+    for root in candidates:
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            continue
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        try:
+            from model import longclip as longclip_mod
+            _longclip_module = longclip_mod
+            _longclip_tokenize = longclip_mod.tokenize
+            print(f"[INFO] Loaded LongCLIP from: {root}")
+            return _longclip_module, _longclip_tokenize
+        except Exception as exc:
+            last_exc = exc
+
+    raise RuntimeError(
+        f"LongCLIP is not available; install longclip or check third_party/Long-CLIP exists "
+        f"(default: {DEFAULT_LONGCLIP_ROOT})"
+    ) from last_exc
+
+
+def load_longclip_model(longclip_model_path, device, longclip_root=None):
+    """Load LongCLIP model from checkpoint."""
+    longclip_mod, longclip_tok = resolve_longclip_module(longclip_root)
+
+    if not longclip_model_path:
+        raise ValueError("LongCLIP model path is empty.")
+
+    # Handle relative paths
+    if not os.path.isabs(longclip_model_path):
+        # Try relative to current working directory
+        if not os.path.isfile(longclip_model_path):
+            # Try relative to script directory
+            script_relative = os.path.join(SCRIPT_DIR, longclip_model_path)
+            if os.path.isfile(script_relative):
+                longclip_model_path = script_relative
+            else:
+                # Try default location
+                default_path = os.path.join(DEFAULT_LONGCLIP_ROOT, "checkpoints", "longclip-L.pt")
+                if os.path.isfile(default_path):
+                    longclip_model_path = default_path
+
+    if not os.path.isfile(longclip_model_path):
+        raise FileNotFoundError(f"LongCLIP model not found: {longclip_model_path}")
+
+    print(f"[INFO] Loading LongCLIP from: {longclip_model_path}")
+    # Load to CPU first, then move to device to avoid GPU memory fragmentation
+    model, preprocess = longclip_mod.load(longclip_model_path, device="cpu")
+    model = model.to(device)
+    model.eval()
+    return model, preprocess, longclip_tok
 
 from ocnn.octree import Octree, Points
 import ocnn
@@ -69,9 +153,30 @@ class Converter(nn.Module):
 
         self.pointcloud_dir = self.opt.pointcloud_dir
 
+        # LongCLIP support
+        self.longclip_model = None
+        self.longclip_tokenize = None
+        if self.opt.use_longclip:
+            self._init_longclip()
+
         self.text_embedding = None
         if self.opt.use_text and self.opt.text_prompt:
             self.set_text_prompt(self.opt.text_prompt)
+
+    def _init_longclip(self):
+        """Initialize LongCLIP model for text encoding."""
+        print("[INFO] Initializing LongCLIP for text encoding...")
+        self.longclip_model, _, self.longclip_tokenize = load_longclip_model(
+            self.opt.longclip_model,
+            self.device,
+            longclip_root=DEFAULT_LONGCLIP_ROOT
+        )
+        # Delete visual encoder to save memory (we only need text encoding)
+        if hasattr(self.longclip_model, 'visual'):
+            del self.longclip_model.visual
+        self.longclip_model.requires_grad_(False)
+        self.longclip_model.eval()
+        print("[INFO] LongCLIP initialized successfully.")
     
     def normalize_mesh(self):
         self.mesh.vertices = self.mesh.vertices - self.mesh.bounding_box.centroid
@@ -79,15 +184,37 @@ class Converter(nn.Module):
         self.mesh.vertices /= np.max(distances)
 
     def set_text_prompt(self, text_prompt: str):
-        """Update text prompt and re-encode embedding."""
+        """Update text prompt and re-encode embedding.
+        
+        If use_longclip is enabled, uses LongCLIP for encoding (supports longer context).
+        Otherwise, uses the standard CLIP encoder from the model.
+        """
         self.opt.text_prompt = text_prompt
         if not self.opt.use_text:
             self.text_embedding = None
             return
 
-        token = tokenize(text_prompt)
-        token = token.to(self.device)
-        self.text_embedding = self.model.text_encoder.encode(token).float() # [bs, 77, 768]
+        if self.opt.use_longclip and self.longclip_model is not None:
+            # Use LongCLIP for text encoding
+            context_length = getattr(self.opt, 'longclip_context_length', 248)
+            token = self.longclip_tokenize(text_prompt, context_length=context_length, truncate=True)
+            token = token.to(self.device)
+            with torch.no_grad():
+                # LongCLIP encode_text returns [batch, dim], we need [batch, seq, dim] format
+                # Use token_embedding + transformer like standard CLIP for full sequence
+                x = self.longclip_model.token_embedding(token)
+                x = x + self.longclip_model.positional_embedding[:x.shape[1]]
+                x = x.permute(1, 0, 2)  # NLD -> LND
+                x = self.longclip_model.transformer(x)
+                x = x.permute(1, 0, 2)  # LND -> NLD
+                x = self.longclip_model.ln_final(x)
+                self.text_embedding = x.float()  # [bs, context_length, dim]
+            print(f"[INFO] Text encoded with LongCLIP (context_length={context_length})")
+        else:
+            # Use standard CLIP encoder
+            token = tokenize(text_prompt)
+            token = token.to(self.device)
+            self.text_embedding = self.model.text_encoder.encode(token).float()  # [bs, 77, 768]
 
     def load_mesh(self, path, num_samples = 200000):
         self.mesh = trimesh.load(path, force = 'mesh')
@@ -553,6 +680,7 @@ if __name__ == "__main__":
     opt.save_image = str2bool(opt.save_image)
     opt.gaussian_loss = str2bool(opt.gaussian_loss)
     opt.use_local_pretrained_ckpt = str2bool(opt.use_local_pretrained_ckpt)
+    opt.use_longclip = str2bool(opt.use_longclip)
 
     if opt.tsv_path is None and opt.batch_path is not None:
         opt.tsv_path = opt.batch_path

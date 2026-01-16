@@ -64,6 +64,9 @@ class Options:
     ### texture baking
     text_prompt: str = ''
     caption_field: str = 'caption_short'
+    use_longclip: str = 'False'
+    longclip_model: str = 'third_party/Long-CLIP/checkpoints/longclip-L.pt'
+    longclip_context_length: int = 248
     tsv_path: Optional[str] = None
     batch_path: Optional[str] = None
     result_tsv: Optional[str] = None
